@@ -11,28 +11,57 @@ from qwen_vl_utils import process_vision_info
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
 VISUAL_DEFINITION = """
-Classify the complete 60-second psychotherapy segment using VISUAL INFORMATION ONLY.
+Classify the complete psychotherapy segment using VISUAL INFORMATION ONLY.
 
-RUPTURE = a clearly visible interaction pattern consistent with movement AWAY FROM the
-other person/interaction or movement AGAINST the other person/interaction.
+The 3RS distinguishes two rupture directions:
 
-Visual evidence may support RUPTURE when it is clear and interactionally directed, for example:
-- sustained turning away or marked visual disengagement from the interaction
-- clear shutting-down-like visible behavior or prolonged closed/still posture in context
-- repeated pushing-away or rejecting gestures, forceful pointing, strong head shaking,
-  or other clearly adversarial directed body behavior
-- a clearly tense/angry facial and bodily pattern directed toward the other person
-- several weaker visual cues that together form a clear pattern
+WITHDRAWAL:
+Movement away from the other person or from the work of therapy.
 
-NO_RUPTURE = no clear visual rupture pattern.
-Do NOT call ordinary talking/mouth movement, normal hand gestures, one gaze shift,
-brief looking down, smiling/laughing, nodding, posture adjustment, brief stillness,
-neutral facial expression, or normal differences in expressiveness a rupture by themselves.
+CONFRONTATION:
+Movement against the other person or the work of therapy.
 
-There is NO audio and NO transcript. Do not infer what either person is saying.
-Do not infer disagreement, criticism, avoidance, pressure, or hostility unless the
-visible interaction itself clearly supports that pattern. Ambiguous behavior = NO_RUPTURE.
-Judge the whole minute, not one isolated frame.
+For this visual-only experiment, use only rupture evidence that can actually
+be supported by visible nonverbal behavior.
+
+Examples explicitly supported by the 3RS manual include:
+
+WITHDRAWAL / SHUTTING DOWN
+- collapsed posture together with avoiding eye contact
+
+CONFRONTATION / COMPLAINING OR CRITICIZING
+- an expression of disgust directed toward the other person
+  when the interactional target is visually clear
+
+CONFRONTATION / PUSHING BACK
+- sitting with arms crossed together with an angry facial expression
+
+CONFRONTATION / CONTROL OR PRESSURE
+- imposing or intimidating body posture directed toward the other person
+
+Important boundaries:
+
+- A visible action is not automatically a rupture.
+- Not every smile, laugh, neutral/straight facial expression, gaze change,
+  pause, posture, or ordinary gesture is movement away or against.
+- Healthy or ordinary interaction should not be classified as rupture merely
+  because one person is expressive, still, looking away briefly, or gesturing.
+- Some 3RS markers depend on speech content, tone, or conversational context.
+  Those markers cannot be established from video frames alone.
+- Do not invent speech content, disagreement, criticism, avoidance, pressure,
+  hostility, or therapeutic meaning.
+- If the available visual information is insufficient to establish movement
+  away or movement against, classify the segment as NO_RUPTURE.
+
+RUPTURE:
+At least one sufficiently clear visually supported withdrawal or confrontation
+pattern is present.
+
+NO_RUPTURE:
+No sufficiently clear visually supported withdrawal or confrontation pattern
+is present.
+
+Judge the complete segment across time rather than one isolated frame.
 """.strip()
 
 

@@ -218,3 +218,15 @@ __marimo__/
 .streamlit/secrets.toml
 output
 data
+.venv_internvl/
+reference_crops/
+old scripts/
+C:\Data\Sequence_model\VLM_experiments\run_v7_using_auto_identity_v3.ps1
+C:\Data\Sequence_model\VLM_experiments\run_v8_1_qwen30_smoke_5_vram_safe.ps1
+C:\Data\Sequence_model\VLM_experiments\run_v8_1_qwen30_smoke_5.ps1
+C:\Data\Sequence_model\VLM_experiments\test_v8_1_qwen30_load.ps1
+build_v7_auto_identity_from_crops_v3.ps1
+run_v7_using_auto_identity_v3.ps1
+run_v8_1_qwen30_smoke_5_vram_safe.ps1
+run_v8_1_qwen30_smoke_5.ps1
+test_v8_1_qwen30_load.ps1
