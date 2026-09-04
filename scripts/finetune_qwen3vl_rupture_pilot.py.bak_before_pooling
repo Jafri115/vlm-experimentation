@@ -1,0 +1,1850 @@
+
+"""
+Pilot Qwen3-VL rupture-salience fine-tuning for PROTECT-AI.
+
+What this script does
+---------------------
+1. Reads the merged 3RS segment-level coder CSV.
+2. Aggregates double-rated labels by 1-minute segment:
+      WD_P_mean = mean patient-withdrawal salience
+      CF_P_mean = mean patient-confrontation salience
+3. Builds a SMALL patient-level pilot split (train/val/test).
+4. Resolves the corresponding full-session videos recursively under VIDEO_ROOT.
+5. Uses the existing patient-side role cache when available.
+6. Samples chronological frames from the labelled 1-minute interval.
+7. Crops the patient using YuNet face detections + cached left/right side.
+8. Loads Qwen/Qwen3-VL-8B-Instruct in 4-bit.
+9. Applies LoRA to the language-model attention projections.
+10. Uses the multimodal backbone hidden state + a small regression head to predict:
+       WD_P_mean, CF_P_mean
+11. Optimizes Huber loss and evaluates MAE / Spearman / rupture-any metrics.
+
+IMPORTANT PILOT DESIGN
+----------------------
+- Patient-only visual input -> predicts patient targets only (WD_P, CF_P).
+- Labels are kept continuous (e.g. 3.5), not rounded.
+- Split is by patient_id to avoid leakage.
+- Default pilot uses 8 patients and <= 15 segments/patient (~120 segments max).
+- Default visual input is 32 frames ACROSS the full 60-second labelled segment.
+  This is intentionally smaller than the final 4 x 15s x 32-frame setup so that
+  the first LoRA experiment is feasible on a 32 GB RTX 5090.
+- Once the pipeline works, increase temporal capacity or move to 4-window MIL.
+
+Expected environment
+--------------------
+Use the existing .venv_molmo2 environment with:
+  transformers >= 4.57
+  torch with CUDA 12.8 support
+  peft >= 0.17
+  bitsandbytes
+  opencv-python
+  pandas
+  scipy
+  scikit-learn
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import os
+import random
+import re
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from scipy.stats import spearmanr
+
+try:
+    from sklearn.metrics import (
+        average_precision_score,
+        precision_recall_fscore_support,
+        roc_auc_score,
+    )
+except Exception:
+    average_precision_score = None
+    precision_recall_fscore_support = None
+    roc_auc_score = None
+
+from transformers import (
+    AutoProcessor,
+    BitsAndBytesConfig,
+    Qwen3VLForConditionalGeneration,
+)
+
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
+
+
+DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+
+PROMPT = """The images are chronological frames sampled from one labelled minute of a psychotherapy session.
+Focus only on the visible patient/person being observed.
+
+Create an internal visual representation useful for estimating two 3RS patient rupture-marker salience scores:
+- WD_P: patient withdrawal salience
+- CF_P: patient confrontation salience
+
+Use only visible patient behavior. Do not use audio or transcript.
+"""
+
+
+# ---------------------------------------------------------------------------
+# General utilities
+# ---------------------------------------------------------------------------
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def parse_hms(value) -> float:
+    """Parse HH:MM:SS, MM:SS, numeric seconds, or pandas-compatible strings."""
+    if pd.isna(value):
+        raise ValueError("Missing segment time.")
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+
+    text = str(value).strip()
+
+    if not text:
+        raise ValueError("Empty segment time.")
+
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    parts = text.split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    if len(parts) == 2:
+        m, s = parts
+        return int(m) * 60 + float(s)
+
+    raise ValueError(f"Unsupported time format: {value!r}")
+
+
+def normalize_id(value) -> str:
+    if pd.isna(value):
+        return ""
+    try:
+        f = float(value)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def safe_float(value, default=np.nan) -> float:
+    try:
+        if pd.isna(value):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(obj, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Label aggregation and pilot manifest
+# ---------------------------------------------------------------------------
+
+def index_videos(video_root: Path) -> Tuple[Dict[str, Path], Dict[str, List[Path]]]:
+    """
+    Recursively map basename -> full path.
+    Duplicate basenames are retained separately and reported.
+    """
+    if not video_root.exists():
+        raise FileNotFoundError(f"Video root does not exist: {video_root}")
+
+    all_videos = []
+    for pattern in ("*.mp4", "*.MP4", "*.mov", "*.MOV", "*.mkv", "*.MKV"):
+        all_videos.extend(video_root.rglob(pattern))
+
+    by_name: Dict[str, Path] = {}
+    duplicates: Dict[str, List[Path]] = {}
+
+    for p in sorted(set(all_videos)):
+        key = p.name.lower()
+        if key in by_name:
+            duplicates.setdefault(key, [by_name[key]]).append(p)
+        else:
+            by_name[key] = p
+
+    return by_name, duplicates
+
+
+def load_role_cache(path: Optional[Path]) -> Dict[str, dict]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Could not read role cache {path}: {exc}") from exc
+
+
+def role_side_for_video(cache: Dict[str, dict], video_name: str) -> Optional[str]:
+    candidates = [
+        video_name,
+        Path(video_name).name,
+        Path(video_name).stem,
+    ]
+
+    lower_map = {str(k).lower(): v for k, v in cache.items()}
+
+    for key in candidates:
+        value = cache.get(key)
+        if value is None:
+            value = lower_map.get(str(key).lower())
+
+        if isinstance(value, dict):
+            side = value.get("patient_side")
+            if side in {"left", "right"}:
+                return side
+
+    return None
+
+
+def aggregate_labels(labels_csv: Path, min_coders: int) -> pd.DataFrame:
+    raw = pd.read_csv(labels_csv)
+
+    required = [
+        "video",
+        "patient_id",
+        "session_id",
+        "coder",
+        "segment_id",
+        "segment_start",
+        "segment_end",
+        "WD_P",
+        "CF_P",
+    ]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(f"Missing required CSV columns: {missing}")
+
+    raw = raw.dropna(subset=["WD_P", "CF_P"]).copy()
+    raw["patient_id"] = raw["patient_id"].map(normalize_id)
+    raw["session_id"] = raw["session_id"].map(normalize_id)
+    raw["video"] = raw["video"].astype(str).str.strip()
+
+    group_cols = [
+        "video",
+        "patient_id",
+        "session_id",
+        "segment_id",
+        "segment_start",
+        "segment_end",
+    ]
+
+    grouped = (
+        raw.groupby(group_cols, dropna=False)
+        .agg(
+            n_rows=("coder", "size"),
+            n_coders=("coder", "nunique"),
+            coders=("coder", lambda s: "|".join(sorted(set(map(str, s))))),
+            WD_P_mean=("WD_P", "mean"),
+            WD_P_min=("WD_P", "min"),
+            WD_P_max=("WD_P", "max"),
+            CF_P_mean=("CF_P", "mean"),
+            CF_P_min=("CF_P", "min"),
+            CF_P_max=("CF_P", "max"),
+        )
+        .reset_index()
+    )
+
+    grouped = grouped[grouped["n_coders"] >= int(min_coders)].copy()
+
+    grouped["WD_P_disagreement"] = (
+        grouped["WD_P_max"] - grouped["WD_P_min"]
+    )
+    grouped["CF_P_disagreement"] = (
+        grouped["CF_P_max"] - grouped["CF_P_min"]
+    )
+
+    start_secs = []
+    end_secs = []
+
+    for row in grouped.itertuples(index=False):
+        start = parse_hms(row.segment_start)
+        end_inclusive = parse_hms(row.segment_end)
+
+        # Annotation files use boundaries such as 00:00:00 -> 00:00:59.
+        # Convert to half-open [start, end) timing by adding one second.
+        end = end_inclusive + 1.0
+
+        if end <= start:
+            end = start + 60.0
+
+        start_secs.append(start)
+        end_secs.append(end)
+
+    grouped["start_sec"] = start_secs
+    grouped["end_sec"] = end_secs
+
+    return grouped
+
+
+def resolve_media(
+    segments: pd.DataFrame,
+    video_root: Path,
+    role_cache: Dict[str, dict],
+    require_role_cache: bool,
+) -> pd.DataFrame:
+    index, duplicates = index_videos(video_root)
+
+    if duplicates:
+        print(
+            f"WARNING: {len(duplicates)} duplicate video basenames found. "
+            "The first sorted path will be used.",
+            flush=True,
+        )
+
+    paths = []
+    sides = []
+    exists = []
+
+    for row in segments.itertuples(index=False):
+        name = Path(str(row.video)).name
+        path = index.get(name.lower())
+        side = role_side_for_video(role_cache, name)
+
+        paths.append(str(path) if path else "")
+        sides.append(side or "")
+        exists.append(path is not None)
+
+    out = segments.copy()
+    out["video_path"] = paths
+    out["patient_side"] = sides
+    out["video_found"] = exists
+
+    before = len(out)
+    out = out[out["video_found"]].copy()
+
+    print(
+        f"Resolved videos: {len(out)}/{before} double-rated segments",
+        flush=True,
+    )
+
+    if require_role_cache:
+        before = len(out)
+        out = out[out["patient_side"].isin(["left", "right"])].copy()
+        print(
+            f"Role-cache filter: {len(out)}/{before} segments retained",
+            flush=True,
+        )
+
+    return out
+
+
+def choose_pilot_patients(
+    candidates: pd.DataFrame,
+    pilot_patients: int,
+    positive_threshold: float,
+    seed: int,
+) -> List[str]:
+    temp = candidates.copy()
+    temp["rupture_any"] = (
+        temp[["WD_P_mean", "CF_P_mean"]].max(axis=1)
+        >= positive_threshold
+    )
+
+    stats = (
+        temp.groupby("patient_id")
+        .agg(
+            n_segments=("segment_id", "size"),
+            n_positive=("rupture_any", "sum"),
+            n_videos=("video", "nunique"),
+        )
+        .reset_index()
+    )
+
+    # Favor patients that provide both enough data and some positive segments,
+    # but use a deterministic random tie-breaker.
+    rng = np.random.default_rng(seed)
+    stats["_jitter"] = rng.uniform(0, 1, len(stats))
+    stats = stats.sort_values(
+        ["n_positive", "n_segments", "_jitter"],
+        ascending=[False, False, True],
+    )
+
+    if len(stats) < pilot_patients:
+        print(
+            f"WARNING: requested {pilot_patients} pilot patients but only "
+            f"{len(stats)} are available after filtering.",
+            flush=True,
+        )
+
+    return stats.head(pilot_patients)["patient_id"].astype(str).tolist()
+
+
+def assign_patient_splits(
+    patient_ids: Sequence[str],
+    candidates: pd.DataFrame,
+    positive_threshold: float,
+    seed: int,
+) -> Dict[str, str]:
+    """
+    Patient-disjoint pilot split:
+      >= 5 patients: roughly 75% train, >=1 val, >=1 test.
+    We preferentially reserve patients that contain at least one positive
+    for val/test so the pilot metrics are not trivially all-negative.
+    """
+    ids = list(dict.fromkeys(map(str, patient_ids)))
+    if len(ids) < 3:
+        raise ValueError("Need at least 3 patients for train/val/test.")
+
+    temp = candidates[candidates["patient_id"].isin(ids)].copy()
+    temp["positive"] = (
+        temp[["WD_P_mean", "CF_P_mean"]].max(axis=1)
+        >= positive_threshold
+    )
+
+    stats = (
+        temp.groupby("patient_id")
+        .agg(n=("segment_id", "size"), pos=("positive", "sum"))
+        .reset_index()
+    )
+
+    rng = np.random.default_rng(seed + 17)
+    stats["_jitter"] = rng.uniform(0, 1, len(stats))
+
+    positive_patients = stats[stats["pos"] > 0].sort_values(
+        ["pos", "n", "_jitter"],
+        ascending=[False, False, True],
+    )
+
+    if len(positive_patients) >= 2:
+        # Do not reserve the single strongest positive patient if possible.
+        reserved = positive_patients.iloc[1:3]["patient_id"].astype(str).tolist()
+        if len(reserved) < 2:
+            reserved = positive_patients.head(2)["patient_id"].astype(str).tolist()
+    else:
+        shuffled = stats.sample(frac=1.0, random_state=seed)
+        reserved = shuffled.head(2)["patient_id"].astype(str).tolist()
+
+    val_patient, test_patient = reserved[0], reserved[1]
+
+    split_map = {}
+    for pid in ids:
+        if pid == val_patient:
+            split_map[pid] = "val"
+        elif pid == test_patient:
+            split_map[pid] = "test"
+        else:
+            split_map[pid] = "train"
+
+    return split_map
+
+
+def sample_patient_segments(
+    patient_df: pd.DataFrame,
+    quota: int,
+    positive_threshold: float,
+    seed: int,
+    split: str,
+) -> pd.DataFrame:
+    """
+    Small pilot sampling. Training is mildly positive-enriched to ensure
+    the model sees enough rupture-marker examples. Validation/test are less
+    aggressively enriched but still guarantee some positives when available.
+
+    This is for pipeline validation, NOT final prevalence estimation.
+    """
+    if len(patient_df) <= quota:
+        return patient_df.copy()
+
+    rng = np.random.default_rng(seed)
+
+    work = patient_df.copy()
+    work["_positive"] = (
+        work[["WD_P_mean", "CF_P_mean"]].max(axis=1)
+        >= positive_threshold
+    )
+
+    pos = work[work["_positive"]].copy()
+    neg = work[~work["_positive"]].copy()
+
+    if split == "train":
+        desired_pos = min(len(pos), max(2, quota // 2))
+    else:
+        desired_pos = min(len(pos), max(1, quota // 3))
+
+    selected = []
+
+    if desired_pos > 0:
+        take = rng.choice(
+            pos.index.to_numpy(),
+            size=desired_pos,
+            replace=False,
+        )
+        selected.extend(take.tolist())
+
+    remaining = quota - len(selected)
+
+    pool = work.drop(index=selected)
+    if remaining > 0 and len(pool) > 0:
+        take_n = min(remaining, len(pool))
+        take = rng.choice(
+            pool.index.to_numpy(),
+            size=take_n,
+            replace=False,
+        )
+        selected.extend(take.tolist())
+
+    result = work.loc[selected].drop(columns=["_positive"])
+    return result.copy()
+
+
+def build_pilot_manifest(args) -> pd.DataFrame:
+    print("\nPREPARING PILOT MANIFEST")
+    print("=" * 72)
+
+    labels_csv = Path(args.labels_csv)
+    video_root = Path(args.video_root)
+    role_cache_path = Path(args.role_cache) if args.role_cache else None
+
+    grouped = aggregate_labels(labels_csv, args.min_coders)
+
+    print(f"Double-rated candidate segments: {len(grouped)}")
+    print(f"Patients before media filtering: {grouped['patient_id'].nunique()}")
+
+    role_cache = load_role_cache(role_cache_path)
+
+    candidates = resolve_media(
+        grouped,
+        video_root=video_root,
+        role_cache=role_cache,
+        require_role_cache=args.require_role_cache,
+    )
+
+    if candidates.empty:
+        raise RuntimeError(
+            "No candidate segments remain after video/role-cache filtering."
+        )
+
+    selected_patients = choose_pilot_patients(
+        candidates,
+        pilot_patients=args.pilot_patients,
+        positive_threshold=args.positive_threshold,
+        seed=args.seed,
+    )
+
+    split_map = assign_patient_splits(
+        selected_patients,
+        candidates,
+        positive_threshold=args.positive_threshold,
+        seed=args.seed,
+    )
+
+    pieces = []
+
+    for i, pid in enumerate(selected_patients):
+        p = candidates[candidates["patient_id"] == pid].copy()
+        p["split"] = split_map[pid]
+
+        sampled = sample_patient_segments(
+            p,
+            quota=args.segments_per_patient,
+            positive_threshold=args.positive_threshold,
+            seed=args.seed + i * 101,
+            split=split_map[pid],
+        )
+        pieces.append(sampled)
+
+    manifest = pd.concat(pieces, ignore_index=True)
+
+    manifest["rupture_any"] = (
+        manifest[["WD_P_mean", "CF_P_mean"]].max(axis=1)
+        >= args.positive_threshold
+    ).astype(int)
+
+    manifest["sample_id"] = manifest.apply(
+        lambda r: (
+            f"{Path(str(r['video'])).stem}"
+            f"_seg{int(r['segment_id']):03d}"
+        ),
+        axis=1,
+    )
+
+    keep_cols = [
+        "sample_id",
+        "split",
+        "video",
+        "video_path",
+        "patient_id",
+        "session_id",
+        "segment_id",
+        "segment_start",
+        "segment_end",
+        "start_sec",
+        "end_sec",
+        "patient_side",
+        "n_coders",
+        "coders",
+        "WD_P_mean",
+        "CF_P_mean",
+        "WD_P_disagreement",
+        "CF_P_disagreement",
+        "rupture_any",
+    ]
+    manifest = manifest[keep_cols].sort_values(
+        ["split", "patient_id", "video", "segment_id"]
+    ).reset_index(drop=True)
+
+    out_path = Path(args.manifest_out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest.to_csv(out_path, index=False)
+
+    print(f"\nSaved pilot manifest: {out_path}")
+    print(f"Total pilot segments: {len(manifest)}")
+    print(f"Patients: {manifest['patient_id'].nunique()}")
+
+    print("\nSplit summary")
+    summary = (
+        manifest.groupby("split")
+        .agg(
+            segments=("sample_id", "size"),
+            patients=("patient_id", "nunique"),
+            rupture_any=("rupture_any", "sum"),
+            WD_P_mean=("WD_P_mean", "mean"),
+            CF_P_mean=("CF_P_mean", "mean"),
+        )
+    )
+    print(summary.to_string())
+
+    print("\nPatient split")
+    patient_split = (
+        manifest[["patient_id", "split"]]
+        .drop_duplicates()
+        .sort_values(["split", "patient_id"])
+    )
+    print(patient_split.to_string(index=False))
+
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# Patient visual crop
+# ---------------------------------------------------------------------------
+
+class PatientCropper:
+    """
+    Reproduces the spirit of the frozen benchmark patient crop:
+    - detect faces on sampled frames with YuNet
+    - use the cached patient side (left/right)
+    - estimate a median face box
+    - expand to a person ROI
+    - apply one fixed ROI to all sampled frames
+    """
+
+    def __init__(
+        self,
+        yunet_model: Path,
+        output_width: int = 320,
+        score_threshold: float = 0.60,
+    ):
+        if not yunet_model.exists():
+            raise FileNotFoundError(
+                f"YuNet model not found: {yunet_model}\n"
+                "Use the same YuNet ONNX file used by the visual benchmark."
+            )
+
+        self.detector = cv2.FaceDetectorYN.create(
+            model=str(yunet_model),
+            config="",
+            input_size=(320, 320),
+            score_threshold=float(score_threshold),
+            nms_threshold=0.30,
+            top_k=5000,
+        )
+        self.output_width = int(output_width)
+
+    def detect(self, image: Image.Image) -> List[Tuple[float, float, float, float]]:
+        rgb = np.asarray(image.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        h, w = bgr.shape[:2]
+
+        self.detector.setInputSize((w, h))
+        _, faces = self.detector.detect(bgr)
+
+        if faces is None:
+            return []
+
+        boxes = []
+        for f in faces:
+            x, y, fw, fh = map(float, f[:4])
+            if min(fw, fh) < 24:
+                continue
+            boxes.append((x, y, fw, fh))
+        return boxes
+
+    @staticmethod
+    def bbox_center_x(box) -> float:
+        x, y, w, h = box
+        return x + w / 2.0
+
+    def choose_face(
+        self,
+        frames: Sequence[Image.Image],
+        side: str,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        detections = []
+
+        # Detect on up to 12 evenly spaced frames.
+        idxs = np.linspace(
+            0,
+            len(frames) - 1,
+            min(12, len(frames)),
+            dtype=int,
+        )
+
+        frame_w = frames[0].width
+
+        for idx in idxs:
+            boxes = self.detect(frames[int(idx)])
+
+            side_boxes = []
+            for box in boxes:
+                cx = self.bbox_center_x(box)
+                this_side = "left" if cx < frame_w / 2.0 else "right"
+                if this_side == side:
+                    side_boxes.append(box)
+
+            if side_boxes:
+                # Prefer the largest face on the cached side.
+                chosen = max(side_boxes, key=lambda b: b[2] * b[3])
+                detections.append(chosen)
+
+        if not detections:
+            return None
+
+        arr = np.asarray(detections, dtype=float)
+        median = np.median(arr, axis=0)
+        return tuple(map(float, median))
+
+    @staticmethod
+    def face_to_roi(
+        face_box,
+        frame_width: int,
+        frame_height: int,
+        width_mult: float = 4.5,
+        top_mult: float = 1.0,
+        bottom_mult: float = 5.0,
+    ) -> Tuple[int, int, int, int]:
+        x, y, w, h = face_box
+        cx = x + w / 2.0
+
+        roi_w = width_mult * w
+        x1 = max(0.0, cx - roi_w / 2.0)
+        x2 = min(float(frame_width), cx + roi_w / 2.0)
+        y1 = max(0.0, y - top_mult * h)
+        y2 = min(float(frame_height), y + h + bottom_mult * h)
+
+        return (
+            int(round(x1)),
+            int(round(y1)),
+            int(round(x2)),
+            int(round(y2)),
+        )
+
+    @staticmethod
+    def half_frame_roi(
+        side: str,
+        frame_width: int,
+        frame_height: int,
+    ) -> Tuple[int, int, int, int]:
+        mid = frame_width // 2
+        if side == "left":
+            return (0, 0, min(frame_width, int(mid * 1.15)), frame_height)
+        return (max(0, int(mid * 0.85)), 0, frame_width, frame_height)
+
+    def resize(self, image: Image.Image) -> Image.Image:
+        if image.width <= self.output_width:
+            return image
+
+        scale = self.output_width / float(image.width)
+        new_h = max(32, int(round(image.height * scale)))
+
+        # Keep dimensions friendly for the vision encoder.
+        new_w = max(32, int(round(self.output_width / 32.0) * 32))
+        new_h = max(32, int(round(new_h / 32.0) * 32))
+
+        return image.resize(
+            (new_w, new_h),
+            Image.Resampling.LANCZOS,
+        )
+
+    def crop(
+        self,
+        frames: Sequence[Image.Image],
+        side: str,
+    ) -> List[Image.Image]:
+        if not frames:
+            raise ValueError("No frames to crop.")
+
+        frame_w, frame_h = frames[0].size
+        face = self.choose_face(frames, side)
+
+        if face is not None:
+            roi = self.face_to_roi(face, frame_w, frame_h)
+        else:
+            # A safe fallback for pilot preprocessing. The manifest records
+            # patient side, so this remains patient-focused even if YuNet
+            # misses the face in this particular minute.
+            roi = self.half_frame_roi(side, frame_w, frame_h)
+
+        out = []
+        for frame in frames:
+            cropped = frame.crop(roi)
+            out.append(self.resize(cropped))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Frame extraction and cache
+# ---------------------------------------------------------------------------
+
+def video_duration_seconds(video_path: Path) -> float:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+
+    if fps and fps > 0 and count and count > 0:
+        return float(count / fps)
+    return float("inf")
+
+
+def sample_segment_frames(
+    video_path: Path,
+    start_sec: float,
+    end_sec: float,
+    num_frames: int,
+) -> List[Image.Image]:
+    duration = video_duration_seconds(video_path)
+    start = max(0.0, float(start_sec))
+    end = min(float(end_sec), duration)
+
+    if not np.isfinite(end):
+        end = float(end_sec)
+
+    if end <= start:
+        raise RuntimeError(
+            f"Invalid segment interval for {video_path.name}: {start} -> {end}"
+        )
+
+    # Sample at bin midpoints so the first/last decoded frames are not exact
+    # boundary frames from adjacent annotated minutes.
+    edges = np.linspace(start, end, num_frames + 1)
+    times = (edges[:-1] + edges[1:]) / 2.0
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    frames = []
+
+    for ts in times:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts) * 1000.0)
+        ok, bgr = cap.read()
+
+        if not ok:
+            continue
+
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(rgb))
+
+    cap.release()
+
+    if len(frames) < max(4, num_frames // 2):
+        raise RuntimeError(
+            f"Only {len(frames)}/{num_frames} frames decoded from "
+            f"{video_path.name} at {start:.1f}-{end:.1f}s."
+        )
+
+    return frames
+
+
+class FrameCache:
+    def __init__(
+        self,
+        cache_root: Path,
+        cropper: PatientCropper,
+        num_frames: int,
+    ):
+        self.root = cache_root
+        self.cropper = cropper
+        self.num_frames = int(num_frames)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def sample_dir(self, sample_id: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_id)
+        return self.root / safe
+
+    def load_cached(self, directory: Path) -> Optional[List[Image.Image]]:
+        files = sorted(directory.glob("frame_*.jpg"))
+
+        if len(files) != self.num_frames:
+            return None
+
+        return [
+            Image.open(p).convert("RGB")
+            for p in files
+        ]
+
+    def build(self, row) -> List[Image.Image]:
+        directory = self.sample_dir(str(row.sample_id))
+        cached = self.load_cached(directory)
+
+        if cached is not None:
+            return cached
+
+        frames = sample_segment_frames(
+            Path(row.video_path),
+            float(row.start_sec),
+            float(row.end_sec),
+            self.num_frames,
+        )
+
+        # If decode returned slightly fewer frames, deterministically resample
+        # the decoded set to the requested count.
+        if len(frames) != self.num_frames:
+            idxs = np.linspace(
+                0,
+                len(frames) - 1,
+                self.num_frames,
+                dtype=int,
+            )
+            frames = [frames[int(i)] for i in idxs]
+
+        side = str(row.patient_side)
+        if side not in {"left", "right"}:
+            raise RuntimeError(
+                f"No valid patient_side for {row.sample_id}: {side!r}"
+            )
+
+        frames = self.cropper.crop(frames, side)
+
+        directory.mkdir(parents=True, exist_ok=True)
+
+        for i, frame in enumerate(frames, start=1):
+            frame.save(
+                directory / f"frame_{i:03d}.jpg",
+                quality=92,
+                subsampling=0,
+            )
+
+        write_json(
+            directory / "meta.json",
+            {
+                "sample_id": str(row.sample_id),
+                "video_path": str(row.video_path),
+                "start_sec": float(row.start_sec),
+                "end_sec": float(row.end_sec),
+                "patient_side": side,
+                "num_frames": self.num_frames,
+            },
+        )
+
+        return frames
+
+
+# ---------------------------------------------------------------------------
+# Model and prediction head
+# ---------------------------------------------------------------------------
+
+class RuptureRegressionHead(nn.Module):
+    def __init__(self, hidden_size: int, dropout: float = 0.10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 2),
+        )
+
+    def forward(self, pooled_hidden: torch.Tensor) -> torch.Tensor:
+        raw = self.net(pooled_hidden.float())
+        # Keep predictions within the 3RS 1-5 scale.
+        return 1.0 + 4.0 * torch.sigmoid(raw)
+
+
+def get_backbone(peft_model):
+    """
+    PeftModel -> original Qwen3VLForConditionalGeneration -> .model
+    Calling the Qwen3VLModel directly avoids allocating vocabulary logits.
+    LoRA layers are still active because PEFT injects them into the original
+    module tree.
+    """
+    if hasattr(peft_model, "get_base_model"):
+        base = peft_model.get_base_model()
+    else:
+        base = peft_model
+
+    if not hasattr(base, "model"):
+        raise RuntimeError(
+            f"Unexpected model structure: {type(base)} has no .model"
+        )
+
+    return base.model
+
+
+def build_model_and_processor(args):
+    print("\nLOADING QWEN3-VL")
+    print("=" * 72)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this pilot.")
+
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("CUDA capability:", torch.cuda.get_device_capability(0))
+
+    quant_config = None
+
+    if not args.no_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        args.model_id,
+        quantization_config=quant_config,
+        dtype=torch.bfloat16,
+        device_map={"": 0},
+        attn_implementation=args.attn_implementation,
+    )
+
+    processor = AutoProcessor.from_pretrained(args.model_id)
+
+    if not args.no_4bit:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=True,
+        )
+
+    model.config.use_cache = False
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    # Explicitly keep vision encoder frozen for the initial pilot.
+    base = model.get_base_model()
+    if hasattr(base, "model") and hasattr(base.model, "visual"):
+        for p in base.model.visual.parameters():
+            p.requires_grad = False
+
+    model.print_trainable_parameters()
+
+    hidden_size = int(base.config.text_config.hidden_size)
+    head = RuptureRegressionHead(
+        hidden_size=hidden_size,
+        dropout=args.head_dropout,
+    ).to("cuda", dtype=torch.float32)
+
+    return model, processor, head
+
+
+def prepare_multimodal_inputs(
+    processor,
+    frames: Sequence[Image.Image],
+    device: torch.device,
+):
+    content = [
+        {"type": "image", "image": frame}
+        for frame in frames
+    ]
+    content.append({"type": "text", "text": PROMPT})
+
+    messages = [
+        {
+            "role": "user",
+            "content": content,
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+
+    moved = {}
+
+    for key, value in inputs.items():
+        if not torch.is_tensor(value):
+            moved[key] = value
+            continue
+
+        if key in {"pixel_values", "pixel_values_videos"}:
+            moved[key] = value.to(device=device, dtype=torch.bfloat16)
+        else:
+            moved[key] = value.to(device=device)
+
+    return moved
+
+
+def predict_scores(
+    model,
+    head,
+    processor,
+    frames,
+    device,
+):
+    inputs = prepare_multimodal_inputs(
+        processor,
+        frames,
+        device,
+    )
+
+    backbone = get_backbone(model)
+
+    outputs = backbone(
+        **inputs,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    hidden = outputs.last_hidden_state
+    attention_mask = inputs.get("attention_mask")
+
+    if attention_mask is None:
+        pooled = hidden[:, -1, :]
+    else:
+        last_idx = attention_mask.long().sum(dim=1) - 1
+        batch_idx = torch.arange(
+            hidden.shape[0],
+            device=hidden.device,
+        )
+        pooled = hidden[batch_idx, last_idx, :]
+
+    return head(pooled)
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def safe_spearman(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if len(y_true) < 3:
+        return float("nan")
+    if np.allclose(y_true, y_true[0]):
+        return float("nan")
+    try:
+        return float(spearmanr(y_true, y_pred).statistic)
+    except Exception:
+        return float("nan")
+
+
+def compute_metrics(
+    rows: List[dict],
+    positive_threshold: float,
+) -> dict:
+    if not rows:
+        return {}
+
+    df = pd.DataFrame(rows)
+
+    metrics = {
+        "n": int(len(df)),
+        "WD_P_MAE": float(np.mean(np.abs(df["WD_P_true"] - df["WD_P_pred"]))),
+        "CF_P_MAE": float(np.mean(np.abs(df["CF_P_true"] - df["CF_P_pred"]))),
+        "WD_P_spearman": safe_spearman(
+            df["WD_P_true"].to_numpy(),
+            df["WD_P_pred"].to_numpy(),
+        ),
+        "CF_P_spearman": safe_spearman(
+            df["CF_P_true"].to_numpy(),
+            df["CF_P_pred"].to_numpy(),
+        ),
+    }
+
+    true_any = (
+        df[["WD_P_true", "CF_P_true"]].max(axis=1)
+        >= positive_threshold
+    ).astype(int).to_numpy()
+
+    pred_score = df[["WD_P_pred", "CF_P_pred"]].max(axis=1).to_numpy()
+    pred_any = (pred_score >= positive_threshold).astype(int)
+
+    tp = int(np.sum((true_any == 1) & (pred_any == 1)))
+    fp = int(np.sum((true_any == 0) & (pred_any == 1)))
+    fn = int(np.sum((true_any == 1) & (pred_any == 0)))
+    tn = int(np.sum((true_any == 0) & (pred_any == 0)))
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall)
+        else 0.0
+    )
+
+    metrics.update(
+        {
+            "rupture_any_TP": tp,
+            "rupture_any_FP": fp,
+            "rupture_any_FN": fn,
+            "rupture_any_TN": tn,
+            "rupture_any_precision": precision,
+            "rupture_any_recall": recall,
+            "rupture_any_f1": f1,
+        }
+    )
+
+    if len(np.unique(true_any)) == 2 and average_precision_score is not None:
+        try:
+            metrics["rupture_any_AUPRC"] = float(
+                average_precision_score(true_any, pred_score)
+            )
+            metrics["rupture_any_AUROC"] = float(
+                roc_auc_score(true_any, pred_score)
+            )
+        except Exception:
+            pass
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Evaluation and training
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_split(
+    split_df: pd.DataFrame,
+    split_name: str,
+    model,
+    head,
+    processor,
+    frame_cache: FrameCache,
+    device,
+    positive_threshold: float,
+    output_dir: Path,
+    max_examples: Optional[int] = None,
+):
+    model.eval()
+    head.eval()
+
+    rows = []
+
+    eval_df = split_df.copy()
+    if max_examples is not None and max_examples > 0:
+        eval_df = eval_df.head(max_examples)
+
+    print(f"\nEvaluating {split_name}: {len(eval_df)} segments")
+
+    for i, row in enumerate(eval_df.itertuples(index=False), start=1):
+        try:
+            frames = frame_cache.build(row)
+            pred = predict_scores(
+                model,
+                head,
+                processor,
+                frames,
+                device,
+            )[0].float().cpu().numpy()
+
+            rows.append(
+                {
+                    "sample_id": row.sample_id,
+                    "patient_id": row.patient_id,
+                    "video": row.video,
+                    "segment_id": row.segment_id,
+                    "WD_P_true": float(row.WD_P_mean),
+                    "CF_P_true": float(row.CF_P_mean),
+                    "WD_P_pred": float(pred[0]),
+                    "CF_P_pred": float(pred[1]),
+                }
+            )
+
+            print(
+                f"  [{i:03d}/{len(eval_df):03d}] {row.sample_id} | "
+                f"WD {row.WD_P_mean:.1f}->{pred[0]:.2f} | "
+                f"CF {row.CF_P_mean:.1f}->{pred[1]:.2f}",
+                flush=True,
+            )
+
+        except Exception as exc:
+            print(
+                f"  ERROR {row.sample_id}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+        torch.cuda.empty_cache()
+
+    pred_path = output_dir / f"{split_name}_predictions.csv"
+    pd.DataFrame(rows).to_csv(pred_path, index=False)
+
+    metrics = compute_metrics(rows, positive_threshold)
+    write_json(output_dir / f"{split_name}_metrics.json", metrics)
+
+    print(f"\n{split_name.upper()} METRICS")
+    print(json.dumps(metrics, indent=2))
+
+    return metrics
+
+
+def train(args, manifest: pd.DataFrame):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    seed_everything(args.seed)
+
+    train_df = manifest[manifest["split"] == "train"].copy()
+    val_df = manifest[manifest["split"] == "val"].copy()
+    test_df = manifest[manifest["split"] == "test"].copy()
+
+    if train_df.empty or val_df.empty or test_df.empty:
+        raise RuntimeError(
+            "Pilot manifest must contain non-empty train/val/test splits."
+        )
+
+    model, processor, head = build_model_and_processor(args)
+
+    cropper = PatientCropper(
+        yunet_model=Path(args.yunet_model),
+        output_width=args.frame_width,
+    )
+
+    frame_cache = FrameCache(
+        cache_root=Path(args.frame_cache),
+        cropper=cropper,
+        num_frames=args.num_frames,
+    )
+
+    device = torch.device("cuda:0")
+
+    lora_params = [
+        p for p in model.parameters()
+        if p.requires_grad
+    ]
+    head_params = list(head.parameters())
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": lora_params,
+                "lr": args.learning_rate,
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": head_params,
+                "lr": args.head_learning_rate,
+                "weight_decay": args.weight_decay,
+            },
+        ]
+    )
+
+    total_train_examples = len(train_df)
+    steps_per_epoch = math.ceil(
+        total_train_examples / args.grad_accum_steps
+    )
+    planned_steps = steps_per_epoch * args.epochs
+
+    if args.max_train_steps > 0:
+        planned_steps = min(planned_steps, args.max_train_steps)
+
+    print("\nTRAINING PLAN")
+    print("=" * 72)
+    print("Model:", args.model_id)
+    print("Train segments:", len(train_df))
+    print("Val segments:", len(val_df))
+    print("Test segments:", len(test_df))
+    print("Frames / labelled minute:", args.num_frames)
+    print("Gradient accumulation:", args.grad_accum_steps)
+    print("Epochs:", args.epochs)
+    print("Max optimizer steps:", planned_steps)
+    print("LoRA LR:", args.learning_rate)
+    print("Head LR:", args.head_learning_rate)
+    print("Output:", output_dir)
+
+    run_config = vars(args).copy()
+    run_config["prompt"] = PROMPT
+    write_json(output_dir / "run_config.json", run_config)
+
+    best_val = float("inf")
+    best_epoch = None
+    best_optimizer_step = None
+    best_lora_state = None
+    best_head_state = None
+
+    optimizer_step = 0
+    # Counts successful micro-batches accumulated since the last optimizer step.
+    # Reset to zero after every optimizer update, including partial end-of-epoch
+    # updates. This avoids carrying an incorrect accumulation remainder into the
+    # next epoch.
+    accum_counter = 0
+
+    optimizer.zero_grad(set_to_none=True)
+
+    stop_training = False
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEPOCH {epoch}/{args.epochs}")
+        print("=" * 72)
+
+        model.train()
+        head.train()
+
+        epoch_df = train_df.sample(
+            frac=1.0,
+            random_state=args.seed + epoch,
+        ).reset_index(drop=True)
+
+        running_loss = 0.0
+        successful = 0
+
+        for idx, row in enumerate(epoch_df.itertuples(index=False), start=1):
+            if args.max_train_steps > 0 and optimizer_step >= args.max_train_steps:
+                stop_training = True
+                break
+
+            t0 = time.time()
+
+            try:
+                frames = frame_cache.build(row)
+
+                target = torch.tensor(
+                    [[float(row.WD_P_mean), float(row.CF_P_mean)]],
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                pred = predict_scores(
+                    model,
+                    head,
+                    processor,
+                    frames,
+                    device,
+                )
+
+                # Continuous 3RS salience regression.
+                per_target = F.smooth_l1_loss(
+                    pred.float(),
+                    target,
+                    beta=args.huber_beta,
+                    reduction="none",
+                )
+
+                # Equal contribution from WD_P and CF_P for the initial pilot.
+                loss = per_target.mean()
+                scaled_loss = loss / args.grad_accum_steps
+                scaled_loss.backward()
+
+                accum_counter += 1
+                successful += 1
+                running_loss += float(loss.detach().cpu())
+
+                should_step = (
+                    accum_counter >= args.grad_accum_steps
+                    or idx == len(epoch_df)
+                )
+
+                if should_step:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(filter(
+                            lambda p: p.requires_grad,
+                            model.parameters(),
+                        )) + list(head.parameters()),
+                        max_norm=args.max_grad_norm,
+                    )
+
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_step += 1
+                    accum_counter = 0
+
+                pred_np = pred.detach().float().cpu().numpy()[0]
+
+                print(
+                    f"  epoch={epoch} "
+                    f"sample={idx:03d}/{len(epoch_df):03d} "
+                    f"opt_step={optimizer_step:03d} "
+                    f"loss={float(loss.detach()):.4f} "
+                    f"WD={row.WD_P_mean:.1f}->{pred_np[0]:.2f} "
+                    f"CF={row.CF_P_mean:.1f}->{pred_np[1]:.2f} "
+                    f"time={time.time()-t0:.1f}s",
+                    flush=True,
+                )
+
+            except torch.cuda.OutOfMemoryError:
+                optimizer.zero_grad(set_to_none=True)
+                accum_counter = 0
+                torch.cuda.empty_cache()
+                print(
+                    "\nCUDA OOM on sample "
+                    f"{getattr(row, 'sample_id', '?')}.\n"
+                    "For the pilot, rerun with --num-frames 16 before changing "
+                    "the model or crop resolution.",
+                    flush=True,
+                )
+                raise
+
+            except Exception as exc:
+                print(
+                    f"  ERROR {getattr(row, 'sample_id', '?')}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                optimizer.zero_grad(set_to_none=True)
+                accum_counter = 0
+
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        mean_loss = running_loss / max(successful, 1)
+        print(f"\nEpoch {epoch} mean training loss: {mean_loss:.4f}")
+
+        # Validate after every epoch.
+        val_metrics = evaluate_split(
+            val_df,
+            "val",
+            model,
+            head,
+            processor,
+            frame_cache,
+            device,
+            positive_threshold=args.positive_threshold,
+            output_dir=output_dir,
+            max_examples=args.max_val_examples,
+        )
+
+        val_mae = (
+            val_metrics.get("WD_P_MAE", float("inf"))
+            + val_metrics.get("CF_P_MAE", float("inf"))
+        ) / 2.0
+
+        checkpoint_dir = output_dir / f"checkpoint_epoch_{epoch}"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        model.save_pretrained(checkpoint_dir / "adapter")
+        processor.save_pretrained(checkpoint_dir / "processor")
+        torch.save(
+            head.state_dict(),
+            checkpoint_dir / "rupture_head.pt",
+        )
+
+        write_json(
+            checkpoint_dir / "metrics.json",
+            {
+                "epoch": epoch,
+                "optimizer_step": optimizer_step,
+                "mean_train_loss": mean_loss,
+                "val_metrics": val_metrics,
+            },
+        )
+
+        if val_mae < best_val:
+            best_val = val_mae
+            best_epoch = epoch
+            best_optimizer_step = optimizer_step
+
+            best_dir = output_dir / "best"
+            best_dir.mkdir(parents=True, exist_ok=True)
+
+            model.save_pretrained(best_dir / "adapter")
+            processor.save_pretrained(best_dir / "processor")
+            torch.save(
+                head.state_dict(),
+                best_dir / "rupture_head.pt",
+            )
+            write_json(
+                best_dir / "metrics.json",
+                {
+                    "epoch": epoch,
+                    "optimizer_step": optimizer_step,
+                    "mean_train_loss": mean_loss,
+                    "val_metrics": val_metrics,
+                },
+            )
+
+            # Keep an exact CPU copy of the best validation checkpoint.
+            # The final test will restore this state instead of evaluating
+            # whichever epoch happens to be left in GPU memory.
+            best_lora_state = {
+                key: value.detach().cpu().clone()
+                for key, value in get_peft_model_state_dict(model).items()
+            }
+            best_head_state = {
+                key: value.detach().cpu().clone()
+                for key, value in head.state_dict().items()
+            }
+
+            print(
+                f"New best checkpoint: epoch {epoch}, "
+                f"mean val MAE={val_mae:.4f}",
+                flush=True,
+            )
+
+        if stop_training:
+            break
+
+    print("\nRESTORING BEST VALIDATION CHECKPOINT")
+    print("=" * 72)
+
+    if best_lora_state is None or best_head_state is None:
+        raise RuntimeError(
+            "No best validation checkpoint was captured; cannot run final test."
+        )
+
+    set_peft_model_state_dict(
+        model,
+        best_lora_state,
+        adapter_name="default",
+    )
+    head.load_state_dict(best_head_state)
+    head.to(device=device, dtype=torch.float32)
+
+    model.eval()
+    head.eval()
+
+    print(
+        f"Restored best checkpoint from epoch {best_epoch} "
+        f"(optimizer step {best_optimizer_step}, "
+        f"mean val MAE={best_val:.4f}).",
+        flush=True,
+    )
+
+    print("\nFINAL TEST EVALUATION")
+    print("=" * 72)
+
+    # IMPORTANT: final test is evaluated with the checkpoint selected only
+    # from validation performance, not simply the final epoch.
+    test_metrics = evaluate_split(
+        test_df,
+        "test",
+        model,
+        head,
+        processor,
+        frame_cache,
+        device,
+        positive_threshold=args.positive_threshold,
+        output_dir=output_dir,
+        max_examples=args.max_test_examples,
+    )
+
+    write_json(
+        output_dir / "final_summary.json",
+        {
+            "best_val_mean_mae": best_val,
+            "best_epoch": best_epoch,
+            "best_optimizer_step": best_optimizer_step,
+            "test_checkpoint": "best_validation",
+            "test_metrics": test_metrics,
+        },
+    )
+
+    print("\nFINISHED")
+    print("Best adapter:", output_dir / "best" / "adapter")
+    print("Best head:", output_dir / "best" / "rupture_head.pt")
+    print("Test predictions:", output_dir / "test_predictions.csv")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def make_parser():
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Input data.
+    p.add_argument(
+        "--labels-csv",
+        required=True,
+        help="Merged coder segment CSV.",
+    )
+    p.add_argument(
+        "--video-root",
+        default=r"C:\Data\Sequence_model\Memopsy_videos\CONVERTED",
+        help="Root containing full-session videos, searched recursively.",
+    )
+    p.add_argument(
+        "--role-cache",
+        default=r".\output\qwen3vl_visual_experiment_v5\patient_role_cache.json",
+        help="Existing patient-side cache from the visual benchmark.",
+    )
+    p.add_argument(
+        "--yunet-model",
+        default=r".\models\face_detection_yunet\face_detection_yunet_2026may.onnx",
+        help="YuNet face detector already used in the visual pipeline.",
+    )
+
+    # Pilot manifest.
+    p.add_argument(
+        "--manifest-out",
+        default=r".\output\qwen3vl_rupture_finetune_pilot\pilot_manifest.csv",
+    )
+    p.add_argument("--min-coders", type=int, default=2)
+    p.add_argument("--pilot-patients", type=int, default=8)
+    p.add_argument("--segments-per-patient", type=int, default=15)
+    p.add_argument("--positive-threshold", type=float, default=3.0)
+
+    p.add_argument(
+        "--require-role-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retain only videos whose patient left/right side is already cached.",
+    )
+
+    # Model.
+    p.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    p.add_argument(
+        "--attn-implementation",
+        default="sdpa",
+        choices=["sdpa", "eager", "flash_attention_2"],
+    )
+    p.add_argument(
+        "--no-4bit",
+        action="store_true",
+        help="Disable QLoRA 4-bit loading.",
+    )
+
+    # Visual input.
+    p.add_argument(
+        "--num-frames",
+        type=int,
+        default=32,
+        help=(
+            "Chronological frames across the labelled one-minute segment. "
+            "Use 32 for the initial pilot."
+        ),
+    )
+    p.add_argument("--frame-width", type=int, default=320)
+    p.add_argument(
+        "--frame-cache",
+        default=r".\output\qwen3vl_rupture_finetune_pilot\frame_cache_32",
+    )
+
+    # LoRA and regression head.
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=32)
+    p.add_argument("--lora-dropout", type=float, default=0.05)
+    p.add_argument("--head-dropout", type=float, default=0.10)
+
+    # Training.
+    p.add_argument("--epochs", type=int, default=2)
+    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--head-learning-rate", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--grad-accum-steps", type=int, default=4)
+    p.add_argument("--huber-beta", type=float, default=0.5)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument(
+        "--max-train-steps",
+        type=int,
+        default=40,
+        help="Optimizer steps; 40 is intentionally small for the first smoke pilot.",
+    )
+    p.add_argument(
+        "--max-val-examples",
+        type=int,
+        default=0,
+        help="0 means use all validation examples.",
+    )
+    p.add_argument(
+        "--max-test-examples",
+        type=int,
+        default=0,
+        help="0 means use all test examples.",
+    )
+
+    p.add_argument(
+        "--output-dir",
+        default=r".\output\qwen3vl_rupture_finetune_pilot\run1",
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Only build and inspect the pilot manifest; do not load/train Qwen.",
+    )
+
+    return p
+
+
+def main():
+    parser = make_parser()
+    args = parser.parse_args()
+
+    # Normalize 0 -> None for evaluation limits.
+    if args.max_val_examples <= 0:
+        args.max_val_examples = None
+    if args.max_test_examples <= 0:
+        args.max_test_examples = None
+
+    print("QWEN3-VL PATIENT RUPTURE-SALIENCE PILOT")
+    print("=" * 72)
+    print("Labels:", args.labels_csv)
+    print("Video root:", args.video_root)
+    print("Model:", args.model_id)
+
+    manifest = build_pilot_manifest(args)
+
+    if args.prepare_only:
+        print("\nPREPARE-ONLY complete. No model was loaded.")
+        return
+
+    train(args, manifest)
+
+
+if __name__ == "__main__":
+    main()

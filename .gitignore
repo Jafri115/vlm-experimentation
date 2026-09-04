@@ -230,3 +230,11 @@ run_v7_using_auto_identity_v3.ps1
 run_v8_1_qwen30_smoke_5_vram_safe.ps1
 run_v8_1_qwen30_smoke_5.ps1
 test_v8_1_qwen30_load.ps1
+.venv_minicpm/
+.venv_molmo2/
+.venv_llavavideo/
+*.zip
+*.csv
+*.ps1
+
+models/face_detection_yunet/face_detection_yunet_2026may.onnx

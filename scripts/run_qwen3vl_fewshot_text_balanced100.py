@@ -1,0 +1,1567 @@
+#!/usr/bin/env python
+"""
+Qwen3-VL two-stage few-shot text reasoning on balanced-100 psychotherapy clips
+=============================================================================
+
+Research question
+-----------------
+Direct zero-shot video -> RUPTURE/NO_RUPTURE collapsed to NO_RUPTURE even after
+prompt calibration. This experiment separates:
+
+    Stage 1: video -> literal visible-behavior description
+    Stage 2: description -> rupture classification
+
+and compares:
+    A) zero-shot text reasoning
+    B) few-shot text reasoning with 3 positive + 3 negative demonstrations
+
+The same held-out descriptions are used for A and B.
+
+IMPORTANT DESIGN RULES
+----------------------
+1. Stage-1 descriptions are generated WITHOUT loading human labels.
+2. Human labels are loaded only after all requested descriptions are cached.
+3. Demonstration clips are excluded from evaluation.
+4. Demonstrations are selected deterministically from the balanced-100 set.
+5. The few-shot prompt contains only textual descriptions + labels, not videos.
+6. The direct-video baseline can optionally be re-evaluated on the exact same
+   held-out clips using the prior prompt-bias predictions CSV.
+
+This is a diagnostic few-shot experiment, not a patient-disjoint final model
+evaluation. If it shows a useful signal, a repeated/demo-patient-disjoint
+version can be run next.
+
+Dependencies / reuse
+--------------------
+Put this file in:
+    C:\\Data\\Sequence_model\\VLM_experiments\\scripts\\
+
+It reuses:
+    run_qwen3vl_prompt_bias_balanced100.py
+    run_qwen3vl_visual_baseline_100.py
+
+which should already be in the same scripts directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+import re
+import time
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from qwen_vl_utils import process_vision_info
+
+import run_qwen3vl_prompt_bias_balanced100 as pb
+import run_qwen3vl_visual_baseline_100 as base
+
+
+DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+
+TEXT_CONDITIONS = ("text_zero_shot", "text_few_shot")
+
+
+# ============================================================================
+# General helpers
+# ============================================================================
+
+def safe_text(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and np.isnan(x):
+        return ""
+    return str(x)
+
+
+def normalize_label(x: str) -> str:
+    text = safe_text(x).strip().upper().replace("-", "_").replace(" ", "_")
+    if text == "RUPTURE":
+        return "RUPTURE"
+    if text in {"NO_RUPTURE", "NORUPTURE"}:
+        return "NO_RUPTURE"
+    raise ValueError(f"Invalid label: {x!r}")
+
+
+def extract_json_object(raw: str) -> Dict:
+    """
+    Robustly pull one JSON object from model output.
+    """
+    raw = safe_text(raw).strip()
+
+    # Markdown fence cleanup.
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        candidate = raw[start:end + 1]
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    raise ValueError(f"Could not parse JSON object from: {raw[:500]!r}")
+
+
+def parse_text_classification(raw: str) -> Dict:
+    """
+    Parse label + optional explanation. Falls back to strict label extraction.
+    """
+    try:
+        obj = extract_json_object(raw)
+        label = normalize_label(obj.get("label", ""))
+        return {
+            "label": label,
+            "reason": safe_text(obj.get("reason", "")).strip(),
+        }
+    except Exception:
+        upper = safe_text(raw).upper()
+
+        # Check NO_RUPTURE first because it contains RUPTURE as a substring.
+        if re.search(r"\bNO[_\s-]?RUPTURE\b", upper):
+            return {"label": "NO_RUPTURE", "reason": safe_text(raw).strip()}
+
+        if re.search(r"\bRUPTURE\b", upper):
+            return {"label": "RUPTURE", "reason": safe_text(raw).strip()}
+
+        raise
+
+
+def binary_metrics(y_true, y_pred) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+
+    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+    tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+
+    n = len(y_true)
+    prevalence = float(np.mean(y_true)) if n else np.nan
+    pred_pos_fraction = float(np.mean(y_pred)) if n else np.nan
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else np.nan
+    specificity = tn / (tn + fp) if (tn + fp) else np.nan
+
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if np.isfinite(recall) and (precision + recall) > 0
+        else 0.0
+    )
+
+    accuracy = (tp + tn) / n if n else np.nan
+
+    balanced_accuracy = (
+        (recall + specificity) / 2.0
+        if np.isfinite(recall) and np.isfinite(specificity)
+        else np.nan
+    )
+
+    return {
+        "N": int(n),
+        "positive_n": int(np.sum(y_true == 1)),
+        "negative_n": int(np.sum(y_true == 0)),
+        "prevalence": prevalence,
+        "predicted_rupture_n": int(np.sum(y_pred == 1)),
+        "predicted_rupture_fraction": pred_pos_fraction,
+        "TP": tp,
+        "TN": tn,
+        "FP": fp,
+        "FN": fn,
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_accuracy,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+    }
+
+
+# ============================================================================
+# Stage 1: literal visual-description generation
+# ============================================================================
+
+def build_description_messages(
+    frames,
+    sample_fps: float,
+    role_description: str,
+    total_pixels: int,
+):
+    """
+    Pure perception prompt. No rupture definition, no class labels.
+    """
+    prompt = f"""
+ROLE LAYOUT:
+{role_description}
+
+You are viewing one chronological psychotherapy segment represented by sampled
+video frames from the complete approximately 60-second segment.
+
+TASK:
+Describe ONLY directly visible behavior and visible changes across the segment.
+
+Focus on:
+- gaze direction and visible gaze shifts,
+- head orientation and head movement,
+- facial movement or visible facial-action changes,
+- mouth movement / pauses in visible mouth movement,
+- hands and arms where visible,
+- torso and posture,
+- gross body movement,
+- stillness versus increased movement,
+- repeated, sustained, or brief temporal changes.
+
+IMPORTANT:
+- Do NOT classify rupture, withdrawal, confrontation, resistance, alliance,
+  engagement, avoidance, emotion, intention, motivation, attitude, or diagnosis.
+- Do NOT infer speech content or tone of voice.
+- Do NOT use filenames, IDs, or metadata as behavioral evidence.
+- Keep observations literal and visual.
+- Distinguish sustained/repeated behavior from brief changes.
+
+Return JSON only:
+
+{{
+  "patient_visible_behavior": "compact literal summary",
+  "therapist_visible_behavior": "compact literal summary",
+  "temporal_changes": [
+    {{
+      "approx_time": "0-15s",
+      "observation": "literal visible observation"
+    }}
+  ],
+  "overall_visible_pattern": "compact visual-only summary"
+}}
+""".strip()
+
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": frames,
+                    "sample_fps": float(sample_fps),
+                    "total_pixels": int(total_pixels),
+                },
+                {
+                    "type": "text",
+                    "text": prompt,
+                },
+            ],
+        }
+    ]
+
+
+class FewShotExperimentModel(pb.PromptBiasClassifier):
+
+    def generate_description(
+        self,
+        frames,
+        sample_fps: float,
+        role_description: str,
+        total_pixels: int,
+        max_new_tokens: int,
+    ) -> Tuple[Dict, str, float]:
+        messages = build_description_messages(
+            frames=frames,
+            sample_fps=sample_fps,
+            role_description=role_description,
+            total_pixels=total_pixels,
+        )
+
+        chat_text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        image_inputs, video_inputs, video_kwargs = process_vision_info(
+            messages,
+            image_patch_size=16,
+            return_video_kwargs=True,
+            return_video_metadata=True,
+        )
+
+        if video_inputs is not None:
+            videos, video_metadatas = zip(*video_inputs)
+            videos = list(videos)
+            video_metadatas = list(video_metadatas)
+        else:
+            videos = None
+            video_metadatas = None
+
+        inputs = self.processor(
+            text=[chat_text],
+            images=image_inputs,
+            videos=videos,
+            video_metadata=video_metadatas,
+            padding=True,
+            return_tensors="pt",
+            do_resize=False,
+            **video_kwargs,
+        ).to(self.device)
+
+        started = time.time()
+
+        with torch.inference_mode():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+            )
+
+        inference_sec = time.time() - started
+
+        generated_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+
+        raw = self.processor.batch_decode(
+            generated_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+
+        obj = extract_json_object(raw)
+
+        result = {
+            "patient_visible_behavior": safe_text(
+                obj.get("patient_visible_behavior", "")
+            ).strip(),
+            "therapist_visible_behavior": safe_text(
+                obj.get("therapist_visible_behavior", "")
+            ).strip(),
+            "temporal_changes": obj.get("temporal_changes", []),
+            "overall_visible_pattern": safe_text(
+                obj.get("overall_visible_pattern", "")
+            ).strip(),
+        }
+
+        del inputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return result, raw, inference_sec
+
+    def classify_description_text(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+    ) -> Tuple[Dict, str, float]:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    }
+                ],
+            }
+        ]
+
+        chat_text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = self.processor(
+            text=[chat_text],
+            padding=True,
+            return_tensors="pt",
+        ).to(self.device)
+
+        started = time.time()
+
+        with torch.inference_mode():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+            )
+
+        inference_sec = time.time() - started
+
+        generated_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+
+        raw = self.processor.batch_decode(
+            generated_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+
+        # Normal parse first. If the model emits an invalid task label
+        # (for example WITHDRAWAL), do not map it manually. Ask the same
+        # model to convert its previous decision into the allowed binary
+        # output space.
+        try:
+            result = parse_text_classification(raw)
+
+        except Exception:
+            del inputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            repair_prompt = (
+                "Your previous answer for this binary classification task "
+                "used an invalid label.\n\n"
+                "Previous answer:\n"
+                + raw
+                + "\n\nAllowed labels are ONLY:\n"
+                "- RUPTURE\n"
+                "- NO_RUPTURE\n\n"
+                "Do not reconsider the evidence and do not introduce a "
+                "third category such as WITHDRAWAL or CONFRONTATION. "
+                "Convert your previous decision into the single closest "
+                "allowed binary label.\n\n"
+                "Return exactly one of these strings:\n"
+                "RUPTURE\n"
+                "NO_RUPTURE"
+            )
+
+            repair_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": repair_prompt,
+                        }
+                    ],
+                }
+            ]
+
+            repair_chat_text = self.processor.apply_chat_template(
+                repair_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+            repair_inputs = self.processor(
+                text=[repair_chat_text],
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+
+            repair_started = time.time()
+
+            with torch.inference_mode():
+                repair_ids = self.model.generate(
+                    **repair_inputs,
+                    max_new_tokens=16,
+                    do_sample=False,
+                    use_cache=True,
+                )
+
+            inference_sec += time.time() - repair_started
+
+            repair_trimmed = [
+                out_ids[len(in_ids):]
+                for in_ids, out_ids in zip(
+                    repair_inputs.input_ids,
+                    repair_ids,
+                )
+            ]
+
+            repair_raw = self.processor.batch_decode(
+                repair_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+
+            try:
+                result = parse_text_classification(repair_raw)
+            except Exception as repair_exc:
+                raise ValueError(
+                    "Invalid binary label after format repair. "
+                    f"Initial output={raw!r}; "
+                    f"repair output={repair_raw!r}"
+                ) from repair_exc
+
+            raw = raw + "\n\n[FORMAT_REPAIR]\n" + repair_raw
+
+            del repair_inputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if "inputs" in locals():
+            try:
+                del inputs
+            except Exception:
+                pass
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return result, raw, inference_sec
+
+
+def description_to_text(row) -> str:
+    temporal = safe_text(getattr(row, "temporal_changes_json", ""))
+    try:
+        temporal_obj = json.loads(temporal) if temporal else []
+        temporal_lines = []
+        for item in temporal_obj:
+            if not isinstance(item, dict):
+                continue
+            t = safe_text(item.get("approx_time", "")).strip()
+            obs = safe_text(item.get("observation", "")).strip()
+            if t or obs:
+                temporal_lines.append(f"- {t}: {obs}".strip())
+        temporal_text = "\n".join(temporal_lines)
+    except Exception:
+        temporal_text = temporal
+
+    return f"""
+Patient visible behavior:
+{safe_text(getattr(row, "patient_visible_behavior", "")).strip()}
+
+Therapist visible behavior:
+{safe_text(getattr(row, "therapist_visible_behavior", "")).strip()}
+
+Temporal visible changes:
+{temporal_text}
+
+Overall visible pattern:
+{safe_text(getattr(row, "overall_visible_pattern", "")).strip()}
+""".strip()
+
+
+# ============================================================================
+# Stage 2: zero-shot and few-shot text reasoning prompts
+# ============================================================================
+
+def reasoning_definition() -> str:
+    """
+    Use the exact same visual definition used by the prior direct baseline.
+    """
+    return safe_text(base.VISUAL_DEFINITION).strip()
+
+
+def build_zero_shot_reasoning_prompt(description: str) -> str:
+    return f"""
+You are classifying a psychotherapy segment using ONLY a literal visual
+description produced by a separate video-observation stage.
+
+VISUAL RUPTURE DEFINITION:
+{reasoning_definition()}
+
+IMPORTANT:
+- The description is the only evidence available.
+- Do not invent events that are not present in the description.
+- Do not infer speech content.
+- Ordinary isolated behaviors are not automatically rupture.
+- Judge the overall temporal visual pattern.
+- Make one binary decision.
+
+TARGET DESCRIPTION:
+{description}
+
+Return JSON only:
+{{
+  "label": "RUPTURE",
+  "reason": "brief explanation grounded only in the supplied description"
+}}
+
+The label must be exactly RUPTURE or NO_RUPTURE.
+""".strip()
+
+
+def build_few_shot_reasoning_prompt(
+    demonstrations: List[Tuple[str, str]],
+    target_description: str,
+) -> str:
+    demo_blocks = []
+
+    for i, (description, label) in enumerate(demonstrations, start=1):
+        demo_blocks.append(
+            f"""
+EXAMPLE {i}
+Visible description:
+{description}
+
+Correct label:
+{label}
+""".strip()
+        )
+
+    demos = "\n\n".join(demo_blocks)
+
+    return f"""
+You are classifying a psychotherapy segment using ONLY a literal visual
+description produced by a separate video-observation stage.
+
+VISUAL RUPTURE DEFINITION:
+{reasoning_definition()}
+
+Below are six labeled demonstrations from the same task. They are examples of
+how the visual definition maps textual visible observations to the binary
+label. Do not copy a label merely because one isolated behavior looks similar;
+compare the overall described pattern.
+
+{demos}
+
+NOW CLASSIFY A NEW HELD-OUT DESCRIPTION.
+
+Visible description:
+{target_description}
+
+IMPORTANT:
+- The target is not one of the demonstrations.
+- Use only the target description plus the task definition and demonstrations.
+- Do not invent speech content, emotion, intention, or hidden context.
+- Ordinary isolated behaviors are not automatically rupture.
+
+Return JSON only:
+{{
+  "label": "RUPTURE",
+  "reason": "brief explanation grounded only in the supplied description"
+}}
+
+The label must be exactly RUPTURE or NO_RUPTURE.
+""".strip()
+
+
+# ============================================================================
+# Demonstration selection
+# ============================================================================
+
+def attach_labels(
+    descriptions: pd.DataFrame,
+    labels_csv: Path,
+) -> pd.DataFrame:
+    labels = pd.read_csv(labels_csv)
+
+    if "eval_id" in labels.columns:
+        labels["segment_idx"] = pd.to_numeric(
+            labels["eval_id"], errors="raise"
+        ).astype(int)
+    elif "segment_idx" in labels.columns:
+        labels["segment_idx"] = pd.to_numeric(
+            labels["segment_idx"], errors="raise"
+        ).astype(int)
+    else:
+        raise ValueError("Labels CSV must contain eval_id or segment_idx.")
+
+    if "human_binary" not in labels.columns:
+        raise ValueError("Labels CSV must contain human_binary.")
+
+    labels["human_binary"] = pd.to_numeric(
+        labels["human_binary"], errors="coerce"
+    )
+
+    keep_cols = ["segment_idx", "human_binary"]
+    for c in (
+        "human_label",
+        "WD_P_mean",
+        "CF_P_mean",
+        "patient_id",
+        "video",
+        "session_id",
+        "segment_id",
+    ):
+        if c in labels.columns and c not in keep_cols:
+            keep_cols.append(c)
+
+    # Avoid duplicate metadata column names on merge.
+    right = labels[keep_cols].copy()
+    merged = descriptions.merge(
+        right,
+        on="segment_idx",
+        how="left",
+        suffixes=("", "_label"),
+        validate="one_to_one",
+    )
+
+    merged = merged[merged["human_binary"].notna()].copy()
+    merged["human_binary"] = merged["human_binary"].astype(int)
+    merged["human_label_binary"] = np.where(
+        merged["human_binary"] == 1,
+        "RUPTURE",
+        "NO_RUPTURE",
+    )
+
+    return merged
+
+
+def choose_demonstrations(
+    merged: pd.DataFrame,
+    n_per_class: int,
+    seed: int,
+) -> pd.DataFrame:
+    """
+    Deterministic sampling. We first try to maximize patient diversity if
+    patient_id is available in the description manifest.
+    """
+    rng = random.Random(seed)
+    chosen_indices = []
+
+    for binary_value in (1, 0):
+        class_df = merged[merged["human_binary"] == binary_value].copy()
+
+        if len(class_df) < n_per_class:
+            raise ValueError(
+                f"Not enough examples for class={binary_value}: "
+                f"need {n_per_class}, have {len(class_df)}"
+            )
+
+        indices = list(class_df.index)
+        rng.shuffle(indices)
+
+        selected = []
+        used_patients = set()
+
+        # First pass: unique patients where possible.
+        if "patient_id" in class_df.columns:
+            for idx in indices:
+                pid = safe_text(merged.loc[idx, "patient_id"])
+                if pid and pid not in used_patients:
+                    selected.append(idx)
+                    used_patients.add(pid)
+                    if len(selected) == n_per_class:
+                        break
+
+        # Second pass: fill if unique patients were insufficient.
+        if len(selected) < n_per_class:
+            for idx in indices:
+                if idx in selected:
+                    continue
+                selected.append(idx)
+                if len(selected) == n_per_class:
+                    break
+
+        chosen_indices.extend(selected)
+
+    demos = merged.loc[chosen_indices].copy()
+
+    # Shuffle final demonstration order, while preserving deterministic seed.
+    order = list(demos.index)
+    rng.shuffle(order)
+    demos = demos.loc[order].reset_index(drop=True)
+    demos["demo_order"] = np.arange(1, len(demos) + 1)
+
+    return demos
+
+
+# ============================================================================
+# Resume helpers
+# ============================================================================
+
+def upsert_csv(df: pd.DataFrame, row: Dict, path: Path, keys: List[str]) -> pd.DataFrame:
+    if not df.empty and all(k in df.columns for k in keys):
+        keep = np.ones(len(df), dtype=bool)
+        for i, old in df.iterrows():
+            same = True
+            for k in keys:
+                same = same and safe_text(old[k]) == safe_text(row[k])
+            if same:
+                keep[i] = False
+        df = df.loc[keep].copy()
+
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    return df
+
+
+def load_csv_or_empty(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+# ============================================================================
+# Description generation stage
+# ============================================================================
+
+def generate_all_descriptions(
+    model: FewShotExperimentModel,
+    segments: pd.DataFrame,
+    descriptions_csv: Path,
+    details_jsonl: Path,
+    sample_fps: float,
+    frame_width: int,
+    max_duration: float,
+    total_pixels: int,
+    role_description: str,
+    max_new_tokens: int,
+):
+    existing = load_csv_or_empty(descriptions_csv)
+
+    done = set()
+    if not existing.empty and {"segment_idx", "status"}.issubset(existing.columns):
+        ok = existing[existing["status"].astype(str) == "ok"]
+        done = set(
+            pd.to_numeric(ok["segment_idx"], errors="coerce")
+            .dropna()
+            .astype(int)
+            .tolist()
+        )
+
+    print("\nSTAGE 1 — LABEL-FREE LITERAL DESCRIPTION GENERATION")
+    print("=" * 76)
+    print(f"Segments total: {len(segments)}")
+    print(f"Already cached: {len(done)}")
+
+    for pos, row in enumerate(segments.itertuples(index=False), start=1):
+        segment_idx = int(row.segment_idx)
+
+        if segment_idx in done:
+            print(
+                f"[{pos}/{len(segments)}] segment {segment_idx}: already described",
+                flush=True,
+            )
+            continue
+
+        segment_path = Path(row.segment_path)
+
+        print(
+            f"\n[{pos}/{len(segments)}] segment {segment_idx}: "
+            f"{segment_path.name}",
+            flush=True,
+        )
+
+        try:
+            frames, timestamps, duration = base.sample_full_segment_frames(
+                video_path=segment_path,
+                sample_fps=sample_fps,
+                max_duration=max_duration,
+                frame_width=frame_width,
+            )
+
+            result, raw, inference_sec = model.generate_description(
+                frames=frames,
+                sample_fps=sample_fps,
+                role_description=role_description,
+                total_pixels=total_pixels,
+                max_new_tokens=max_new_tokens,
+            )
+
+            row_out = {
+                "segment_idx": segment_idx,
+                "segment_path": str(segment_path),
+                "video": getattr(row, "video", ""),
+                "patient_id": getattr(row, "patient_id", ""),
+                "session_id": getattr(row, "session_id", ""),
+                "segment_id": getattr(row, "segment_id", ""),
+                "status": "ok",
+                "error": "",
+                "patient_visible_behavior": result["patient_visible_behavior"],
+                "therapist_visible_behavior": result["therapist_visible_behavior"],
+                "temporal_changes_json": json.dumps(
+                    result["temporal_changes"],
+                    ensure_ascii=False,
+                ),
+                "overall_visible_pattern": result["overall_visible_pattern"],
+                "duration_sec": duration,
+                "frames_sent": len(frames),
+                "inference_sec": inference_sec,
+            }
+
+            existing = upsert_csv(
+                existing,
+                row_out,
+                descriptions_csv,
+                keys=["segment_idx"],
+            )
+
+            with details_jsonl.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "segment_idx": segment_idx,
+                            "timestamps_sec": timestamps,
+                            "description": result,
+                            "raw_model_output": raw,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+            done.add(segment_idx)
+
+            preview = result["overall_visible_pattern"][:140].replace("\n", " ")
+            print(
+                f"  described in {inference_sec:.1f}s | {preview}",
+                flush=True,
+            )
+
+            del frames
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as exc:
+            traceback.print_exc()
+
+            row_out = {
+                "segment_idx": segment_idx,
+                "segment_path": str(segment_path),
+                "video": getattr(row, "video", ""),
+                "patient_id": getattr(row, "patient_id", ""),
+                "session_id": getattr(row, "session_id", ""),
+                "segment_id": getattr(row, "segment_id", ""),
+                "status": "error",
+                "error": repr(exc),
+            }
+
+            existing = upsert_csv(
+                existing,
+                row_out,
+                descriptions_csv,
+                keys=["segment_idx"],
+            )
+
+            print(f"  ERROR: {exc}", flush=True)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    print(f"\nDescriptions saved: {descriptions_csv}")
+
+
+# ============================================================================
+# Text reasoning stage
+# ============================================================================
+
+def run_reasoning(
+    model: FewShotExperimentModel,
+    merged: pd.DataFrame,
+    demos: pd.DataFrame,
+    output_csv: Path,
+    details_jsonl: Path,
+    max_new_tokens: int,
+):
+    demo_ids = set(demos["segment_idx"].astype(int).tolist())
+
+    eval_df = merged[
+        ~merged["segment_idx"].astype(int).isin(demo_ids)
+    ].copy()
+
+    demo_pairs = [
+        (
+            description_to_text(row),
+            normalize_label(row.human_label_binary),
+        )
+        for row in demos.itertuples(index=False)
+    ]
+
+    existing = load_csv_or_empty(output_csv)
+    done = set()
+
+    if not existing.empty and {"segment_idx", "condition", "status"}.issubset(existing.columns):
+        ok = existing[existing["status"].astype(str) == "ok"]
+        for r in ok.itertuples(index=False):
+            done.add((int(r.segment_idx), str(r.condition)))
+
+    print("\nSTAGE 2 — TEXT-ONLY REASONING")
+    print("=" * 76)
+    print(f"Demonstrations: {len(demos)}")
+    print(f"Held-out evaluation clips: {len(eval_df)}")
+    print("Conditions: text_zero_shot, text_few_shot")
+    print()
+
+    for pos, row in enumerate(eval_df.itertuples(index=False), start=1):
+        segment_idx = int(row.segment_idx)
+        description = description_to_text(row)
+
+        for condition in TEXT_CONDITIONS:
+            if (segment_idx, condition) in done:
+                continue
+
+            if condition == "text_zero_shot":
+                prompt = build_zero_shot_reasoning_prompt(description)
+            else:
+                prompt = build_few_shot_reasoning_prompt(
+                    demonstrations=demo_pairs,
+                    target_description=description,
+                )
+
+            try:
+                result, raw, inference_sec = model.classify_description_text(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                )
+
+                out_row = {
+                    "segment_idx": segment_idx,
+                    "condition": condition,
+                    "status": "ok",
+                    "error": "",
+                    "label": result["label"],
+                    "reason": result["reason"],
+                    "inference_sec": inference_sec,
+                }
+
+                for c in ("patient_id", "video", "session_id", "segment_id"):
+                    if hasattr(row, c):
+                        out_row[c] = getattr(row, c)
+
+                existing = upsert_csv(
+                    existing,
+                    out_row,
+                    output_csv,
+                    keys=["segment_idx", "condition"],
+                )
+                done.add((segment_idx, condition))
+
+                with details_jsonl.open("a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "segment_idx": segment_idx,
+                                "condition": condition,
+                                "prediction": result,
+                                "raw_model_output": raw,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+
+                print(
+                    f"[{pos:03d}/{len(eval_df):03d}] "
+                    f"{segment_idx:03d} {condition:15s} -> "
+                    f"{result['label']:10s} | {inference_sec:.2f}s",
+                    flush=True,
+                )
+
+            except Exception as exc:
+                traceback.print_exc()
+
+                out_row = {
+                    "segment_idx": segment_idx,
+                    "condition": condition,
+                    "status": "error",
+                    "error": repr(exc),
+                }
+
+                existing = upsert_csv(
+                    existing,
+                    out_row,
+                    output_csv,
+                    keys=["segment_idx", "condition"],
+                )
+
+                print(
+                    f"[{pos:03d}/{len(eval_df):03d}] "
+                    f"{segment_idx:03d} {condition:15s} -> ERROR {exc}",
+                    flush=True,
+                )
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    return eval_df
+
+
+# ============================================================================
+# Evaluation and comparison
+# ============================================================================
+
+def evaluate_reasoning(
+    merged: pd.DataFrame,
+    demos: pd.DataFrame,
+    predictions_csv: Path,
+    output_dir: Path,
+    direct_predictions_csv: Optional[Path],
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    demo_ids = set(demos["segment_idx"].astype(int).tolist())
+
+    eval_labels = merged[
+        ~merged["segment_idx"].astype(int).isin(demo_ids)
+    ][["segment_idx", "human_binary"]].copy()
+
+    pred = pd.read_csv(predictions_csv)
+    pred = pred[pred["status"].astype(str) == "ok"].copy()
+    pred["segment_idx"] = pd.to_numeric(
+        pred["segment_idx"], errors="raise"
+    ).astype(int)
+
+    joined = pred.merge(
+        eval_labels,
+        on="segment_idx",
+        how="inner",
+        validate="many_to_one",
+    )
+
+    joined["pred_binary"] = (
+        joined["label"].astype(str).str.upper() == "RUPTURE"
+    ).astype(int)
+
+    joined.to_csv(
+        output_dir / "text_predictions_with_labels.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    rows = []
+
+    for condition in TEXT_CONDITIONS:
+        sub = joined[joined["condition"] == condition].copy()
+        if len(sub) == 0:
+            continue
+
+        metrics = binary_metrics(
+            sub["human_binary"].astype(int).to_numpy(),
+            sub["pred_binary"].astype(int).to_numpy(),
+        )
+
+        rows.append(
+            {
+                "condition": condition,
+                **metrics,
+            }
+        )
+
+    # Optional direct video baseline on exact same held-out clips.
+    if direct_predictions_csv is not None and direct_predictions_csv.exists():
+        direct = pd.read_csv(direct_predictions_csv)
+
+        required = {"segment_idx", "condition", "status", "label"}
+        if required.issubset(direct.columns):
+            direct = direct[
+                (direct["condition"].astype(str) == "original")
+                & (direct["status"].astype(str) == "ok")
+            ].copy()
+
+            direct["segment_idx"] = pd.to_numeric(
+                direct["segment_idx"], errors="raise"
+            ).astype(int)
+
+            direct = direct[
+                ~direct["segment_idx"].isin(demo_ids)
+            ].copy()
+
+            direct = direct.merge(
+                eval_labels,
+                on="segment_idx",
+                how="inner",
+                validate="one_to_one",
+            )
+
+            direct["pred_binary"] = (
+                direct["label"].astype(str).str.upper() == "RUPTURE"
+            ).astype(int)
+
+            if len(direct):
+                metrics = binary_metrics(
+                    direct["human_binary"].astype(int).to_numpy(),
+                    direct["pred_binary"].astype(int).to_numpy(),
+                )
+
+                rows.insert(
+                    0,
+                    {
+                        "condition": "direct_video_zero_shot",
+                        **metrics,
+                    },
+                )
+
+    metrics_df = pd.DataFrame(rows)
+    metrics_df.to_csv(
+        output_dir / "few_shot_comparison_metrics.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # Side-by-side predictions.
+    side = joined.pivot_table(
+        index=["segment_idx", "human_binary"],
+        columns="condition",
+        values="label",
+        aggfunc="first",
+    ).reset_index()
+    side.columns.name = None
+
+    side.to_csv(
+        output_dir / "few_shot_side_by_side.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # Changes from text-zero-shot to text-few-shot.
+    change_row = None
+    if {"text_zero_shot", "text_few_shot"}.issubset(side.columns):
+        z = side["text_zero_shot"].astype(str)
+        f = side["text_few_shot"].astype(str)
+
+        change_row = {
+            "N_common": len(side),
+            "changed_total": int(np.sum(z != f)),
+            "NO_to_RUPTURE": int(
+                np.sum((z == "NO_RUPTURE") & (f == "RUPTURE"))
+            ),
+            "RUPTURE_to_NO": int(
+                np.sum((z == "RUPTURE") & (f == "NO_RUPTURE"))
+            ),
+            "same_NO": int(
+                np.sum((z == "NO_RUPTURE") & (f == "NO_RUPTURE"))
+            ),
+            "same_RUPTURE": int(
+                np.sum((z == "RUPTURE") & (f == "RUPTURE"))
+            ),
+        }
+
+    pd.DataFrame([change_row] if change_row else []).to_csv(
+        output_dir / "few_shot_changes_vs_text_zero_shot.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print("\nFINAL FEW-SHOT COMPARISON")
+    print("=" * 100)
+
+    display_cols = [
+        "condition",
+        "N",
+        "predicted_rupture_n",
+        "predicted_rupture_fraction",
+        "TP",
+        "TN",
+        "FP",
+        "FN",
+        "balanced_accuracy",
+        "precision",
+        "recall",
+        "specificity",
+        "f1",
+    ]
+
+    if not metrics_df.empty:
+        print(metrics_df[display_cols].to_string(index=False))
+
+    if change_row:
+        print("\nFEW-SHOT CHANGES VS TEXT ZERO-SHOT")
+        print("=" * 100)
+        print(pd.DataFrame([change_row]).to_string(index=False))
+
+    print(f"\nEvaluation outputs: {output_dir}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main(args):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    descriptions_csv = output_dir / "literal_descriptions.csv"
+    description_details = output_dir / "literal_description_details.jsonl"
+
+    demos_csv = output_dir / "few_shot_demonstrations.csv"
+
+    reasoning_predictions_csv = output_dir / "text_reasoning_predictions.csv"
+    reasoning_details = output_dir / "text_reasoning_details.jsonl"
+
+    evaluation_dir = output_dir / "evaluation"
+
+    segments = pd.read_csv(args.segments_csv)
+
+    required = {"segment_idx", "segment_path"}
+    missing = required - set(segments.columns)
+    if missing:
+        raise ValueError(
+            f"Segments CSV missing required columns: {sorted(missing)}"
+        )
+
+    # Strict label firewall for Stage 1.
+    forbidden = {
+        "human_label",
+        "human_binary",
+        "WD_P",
+        "WD_T",
+        "CF_P",
+        "CF_T",
+        "WD_P_mean",
+        "WD_T_mean",
+        "CF_P_mean",
+        "CF_T_mean",
+    }
+
+    leaked = forbidden.intersection(segments.columns)
+    if leaked:
+        raise ValueError(
+            "Use the LABEL-FREE segments_manifest.csv for Stage 1. "
+            f"Found label columns: {sorted(leaked)}"
+        )
+
+    segments["segment_idx"] = pd.to_numeric(
+        segments["segment_idx"], errors="raise"
+    ).astype(int)
+
+    if args.max_segments is not None:
+        segments = segments.head(args.max_segments).copy()
+
+    total_pixels = int(args.video_token_budget * 32 * 32)
+
+    print("\nQWEN3-VL TWO-STAGE FEW-SHOT EXPERIMENT")
+    print("=" * 76)
+    print(f"Model: {args.model_id}")
+    print(f"Segments: {len(segments)}")
+    print(f"Description sampling: {args.sample_fps} FPS")
+    print(f"Description frame width: {args.frame_width}")
+    print(f"Video token budget: {args.video_token_budget}")
+    print(f"Few-shot demonstrations: {args.n_demos_per_class} + {args.n_demos_per_class}")
+    print(f"Demo seed: {args.demo_seed}")
+    print()
+
+    model = FewShotExperimentModel(args.model_id)
+
+    # ------------------------------------------------------------------
+    # Stage 1: generate literal descriptions WITHOUT labels.
+    # ------------------------------------------------------------------
+    if not args.skip_description_stage:
+        generate_all_descriptions(
+            model=model,
+            segments=segments,
+            descriptions_csv=descriptions_csv,
+            details_jsonl=description_details,
+            sample_fps=args.sample_fps,
+            frame_width=args.frame_width,
+            max_duration=args.max_duration,
+            total_pixels=total_pixels,
+            role_description=args.role_description,
+            max_new_tokens=args.description_max_new_tokens,
+        )
+
+    if not descriptions_csv.exists():
+        raise FileNotFoundError(
+            f"Descriptions not found: {descriptions_csv}"
+        )
+
+    descriptions = pd.read_csv(descriptions_csv)
+    descriptions = descriptions[
+        descriptions["status"].astype(str) == "ok"
+    ].copy()
+
+    if len(descriptions) == 0:
+        raise RuntimeError("No valid descriptions available.")
+
+    # Confirm all requested label-free descriptions are complete before labels.
+    requested_ids = set(segments["segment_idx"].astype(int).tolist())
+    complete_ids = set(
+        pd.to_numeric(descriptions["segment_idx"], errors="coerce")
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+    missing_ids = sorted(requested_ids - complete_ids)
+
+    if missing_ids and not args.allow_missing_descriptions:
+        raise RuntimeError(
+            "Stage 1 is incomplete. Labels will NOT be loaded yet. "
+            f"Missing/error descriptions for {len(missing_ids)} segments: "
+            f"{missing_ids[:20]}"
+        )
+
+    # ------------------------------------------------------------------
+    # LABEL FIREWALL OPENS HERE.
+    # ------------------------------------------------------------------
+    print("\nLABEL FIREWALL OPENED AFTER DESCRIPTION GENERATION.")
+    merged = attach_labels(
+        descriptions=descriptions,
+        labels_csv=Path(args.labels_csv),
+    )
+
+    # Demonstrations may be reused exactly on resume.
+    if demos_csv.exists() and not args.reselect_demonstrations:
+        demos = pd.read_csv(demos_csv)
+        print(f"Reusing demonstrations from: {demos_csv}")
+    else:
+        demos = choose_demonstrations(
+            merged=merged,
+            n_per_class=args.n_demos_per_class,
+            seed=args.demo_seed,
+        )
+        demos.to_csv(
+            demos_csv,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    print("\nFEW-SHOT DEMONSTRATIONS")
+    print("=" * 76)
+    cols = [
+        c for c in (
+            "demo_order",
+            "segment_idx",
+            "patient_id",
+            "human_label_binary",
+            "video",
+            "segment_id",
+        )
+        if c in demos.columns
+    ]
+    print(demos[cols].to_string(index=False))
+
+    # ------------------------------------------------------------------
+    # Stage 2: compare text zero-shot and few-shot on same held-out clips.
+    # ------------------------------------------------------------------
+    run_reasoning(
+        model=model,
+        merged=merged,
+        demos=demos,
+        output_csv=reasoning_predictions_csv,
+        details_jsonl=reasoning_details,
+        max_new_tokens=args.reasoning_max_new_tokens,
+    )
+
+    direct_path = (
+        Path(args.direct_predictions_csv)
+        if args.direct_predictions_csv
+        else None
+    )
+
+    evaluate_reasoning(
+        merged=merged,
+        demos=demos,
+        predictions_csv=reasoning_predictions_csv,
+        output_dir=evaluation_dir,
+        direct_predictions_csv=direct_path,
+    )
+
+    print("\nFINISHED")
+    print(f"Output: {output_dir}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser()
+
+    p.add_argument(
+        "--segments-csv",
+        default="./output/visual_pilot_100/segments_manifest.csv",
+    )
+    p.add_argument(
+        "--labels-csv",
+        default="./output/visual_pilot_100/visual_pilot_100_labels.csv",
+    )
+    p.add_argument(
+        "--direct-predictions-csv",
+        default="./output/qwen3vl_prompt_bias_balanced100/prompt_bias_predictions.csv",
+        help=(
+            "Optional prior direct-video prompt-bias predictions. "
+            "The script uses condition=original and evaluates it on the exact "
+            "same held-out clips after removing demonstration clips."
+        ),
+    )
+    p.add_argument(
+        "--output-dir",
+        default="./output/qwen3vl_fewshot_text_balanced100",
+    )
+    p.add_argument(
+        "--model-id",
+        default=DEFAULT_MODEL,
+    )
+
+    p.add_argument(
+        "--sample-fps",
+        type=float,
+        default=1.0,
+    )
+    p.add_argument(
+        "--frame-width",
+        type=int,
+        default=384,
+    )
+    p.add_argument(
+        "--max-duration",
+        type=float,
+        default=60.0,
+    )
+    p.add_argument(
+        "--video-token-budget",
+        type=int,
+        default=8192,
+    )
+
+    p.add_argument(
+        "--description-max-new-tokens",
+        type=int,
+        default=500,
+    )
+    p.add_argument(
+        "--reasoning-max-new-tokens",
+        type=int,
+        default=180,
+    )
+
+    p.add_argument(
+        "--n-demos-per-class",
+        type=int,
+        default=3,
+    )
+    p.add_argument(
+        "--demo-seed",
+        type=int,
+        default=42,
+    )
+
+    p.add_argument(
+        "--max-segments",
+        type=int,
+        default=None,
+        help="Optional smoke-test limit. Do not use for the final comparison.",
+    )
+
+    p.add_argument(
+        "--skip-description-stage",
+        action="store_true",
+        help="Reuse literal_descriptions.csv without video inference.",
+    )
+    p.add_argument(
+        "--allow-missing-descriptions",
+        action="store_true",
+        help="Allow Stage 2 using only successfully described rows.",
+    )
+    p.add_argument(
+        "--reselect-demonstrations",
+        action="store_true",
+        help="Ignore existing few_shot_demonstrations.csv and select again.",
+    )
+
+    p.add_argument(
+        "--role-description",
+        default=(
+            "Patient is the person on the LEFT side of the video. "
+            "Therapist is the person on the RIGHT side of the video."
+        ),
+    )
+
+    return p
+
+
+if __name__ == "__main__":
+    main(build_parser().parse_args())
