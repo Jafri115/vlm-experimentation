@@ -52,7 +52,10 @@ python scripts/compare_qwen3_8b_wd_to_ground_truth.py `
 
 Evaluation outputs include primary mean-rating metrics, a separate WD-only
 two-or-more-rater consensus analysis, provider metrics, row-level matches, false
-negatives, and false positives. The default comparison directory is:
+negatives, false positives, and `score_threshold_sweep.csv`. The sweep evaluates
+cutoffs from `score >= 2` through `score >= 5` without rerunning inference. Select
+a final cutoff on validation data rather than optimizing and reporting it on the
+same test cohort. The default comparison directory is:
 
 ```text
 output/qwen3_8b_wd_3rs_ground_truth_comparison
