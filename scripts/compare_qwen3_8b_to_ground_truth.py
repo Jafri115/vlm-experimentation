@@ -122,6 +122,7 @@ def build_ground_truth(annotation_path, inventory_path, threshold=1.0):
         wd_mean, cf_mean = sum(wd)/len(wd), sum(cf)/len(cf)
         wd_binary, cf_binary = int(wd_mean > threshold), int(cf_mean > threshold)
         wd_votes, cf_votes = [int(x > threshold) for x in wd], [int(x > threshold) for x in cf]
+        strict_wd = len(set(wd_votes)) == 1 and len(raters) >= 2
         strict = len(set(wd_votes)) == 1 and len(set(cf_votes)) == 1 and len(raters) >= 2
         row = {
             'segment_uid': uid, 'patient_id': key[0], 'session_id': key[1], 'segment_number': key[2],
@@ -134,6 +135,8 @@ def build_ground_truth(annotation_path, inventory_path, threshold=1.0):
             'WD_P_binary_mean_gt1': wd_binary, 'CF_P_binary_mean_gt1': cf_binary,
             'ground_truth_label': type_label(wd_binary, cf_binary),
             'ground_truth_rupture': int(wd_binary or cf_binary),
+            'strict_wd_two_plus_rater_consensus': strict_wd,
+            'strict_wd_binary': wd_votes[0] if strict_wd else '',
             'strict_two_plus_rater_consensus': strict,
             'strict_consensus_label': type_label(wd_votes[0], cf_votes[0]) if strict else '',
             'strict_consensus_rupture': int(wd_votes[0] or cf_votes[0]) if strict else '',
