@@ -1,0 +1,263 @@
+"""Fine-tune Qwen3-8B on transcripts for VLM-aligned WD_P experiments.
+
+Modes:
+  regression: predict mean 1-5 WD_P using SmoothL1 loss.
+  consensus: train/evaluate unanimous binary WD_P rows only.
+  soft: train on 0/0.5/1 rater targets; select/evaluate on consensus rows.
+
+The script consumes aligned_manifest.jsonl produced by
+build_llm_wd_aligned_dataset.py. It never constructs a new split.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+from pathlib import Path
+
+import numpy as np
+
+SYSTEM_PROMPT = """You are encoding a German psychotherapy transcript for the 3RS v2022
+Patient Moves Away (WD_P) construct. T denotes therapist and P denotes patient.
+Attend to patient shutting down, avoiding therapeutic work, and masking experience.
+Do not infer unavailable tone, facial behavior, posture, or pause duration."""
+
+
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+
+def finite(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def prepare_rows(rows, mode):
+    if any(str(row.get('split', '')).lower() not in {'train', 'val', 'test'} for row in rows):
+        raise ValueError('Every aligned row must have split=train, val, or test')
+    patients = {split: {str(r['patient_id']) for r in rows if str(r['split']).lower() == split}
+                for split in ('train', 'val', 'test')}
+    if patients['train'] & patients['val'] or patients['train'] & patients['test'] or patients['val'] & patients['test']:
+        raise ValueError('Patient leakage detected across train/val/test')
+    target = {'regression': 'WD_P_mean', 'consensus': 'WD_consensus', 'soft': 'WD_soft'}[mode]
+    prepared = []
+    for row in rows:
+        if mode == 'consensus' and not finite(row.get('WD_consensus')):
+            continue
+        if not finite(row.get(target)):
+            continue
+        prepared.append({**row, '_target': float(row[target]), 'split': str(row['split']).lower()})
+    for split in ('train', 'val', 'test'):
+        if not any(row['split'] == split for row in prepared):
+            raise ValueError(f'No usable {split} rows for mode={mode}')
+    return prepared
+
+
+def binary_metrics(y, probability, threshold=0.5):
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    y = np.asarray(y, dtype=int); p = np.asarray(probability, dtype=float); pred = (p >= threshold).astype(int)
+    tp = int(((y == 1) & (pred == 1)).sum()); tn = int(((y == 0) & (pred == 0)).sum())
+    fp = int(((y == 0) & (pred == 1)).sum()); fn = int(((y == 1) & (pred == 0)).sum())
+    div = lambda a, b: float(a/b) if b else 0.0
+    precision, recall, specificity = div(tp, tp+fp), div(tp, tp+fn), div(tn, tn+fp)
+    return {'N': len(y), 'TP': tp, 'TN': tn, 'FP': fp, 'FN': fn,
+            'accuracy': div(tp+tn, len(y)), 'balanced_accuracy': (recall+specificity)/2,
+            'precision': precision, 'recall': recall, 'specificity': specificity,
+            'f1': div(2*precision*recall, precision+recall),
+            'auprc': float(average_precision_score(y, p)) if y.sum() else None,
+            'auroc': float(roc_auc_score(y, p)) if len(np.unique(y)) == 2 else None,
+            'prevalence': float(y.mean()), 'predicted_positive_rate': float(pred.mean()),
+            'probability_min': float(p.min()), 'probability_max': float(p.max()),
+            'probability_mean': float(p.mean()), 'threshold': threshold}
+
+
+def regression_metrics(y, prediction):
+    from scipy.stats import spearmanr
+    y = np.asarray(y, dtype=float); p = np.asarray(prediction, dtype=float)
+    rho = spearmanr(y, p).statistic if len(y) > 1 else float('nan')
+    return {'N': len(y), 'mae': float(np.abs(y-p).mean()), 'rmse': float(np.sqrt(((y-p)**2).mean())),
+            'spearman': float(rho) if np.isfinite(rho) else None,
+            'true_min': float(y.min()), 'true_max': float(y.max()),
+            'prediction_min': float(p.min()), 'prediction_max': float(p.max()),
+            'prediction_mean': float(p.mean())}
+
+
+def main(args):
+    rows = prepare_rows(read_jsonl(args.dataset), args.mode)
+    random.seed(args.seed); np.random.seed(args.seed)
+    output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
+    config = vars(args).copy(); config['dataset'] = str(args.dataset.resolve()); config['output'] = str(output)
+    config['system_prompt'] = SYSTEM_PROMPT
+    (output/'run_config.json').write_text(json.dumps(config, indent=2, default=str)+'\n', encoding='utf-8')
+    counts = {split: sum(row['split'] == split for row in rows) for split in ('train', 'val', 'test')}
+    patients = {split: sorted({str(row['patient_id']) for row in rows if row['split'] == split}) for split in counts}
+    preparation = {'mode': args.mode, 'row_counts': counts, 'patients': patients,
+                   'patient_disjoint': not (set(patients['train']) & set(patients['val']) or
+                                            set(patients['train']) & set(patients['test']) or
+                                            set(patients['val']) & set(patients['test']))}
+    (output/'preparation.json').write_text(json.dumps(preparation, indent=2)+'\n', encoding='utf-8')
+    print(json.dumps(preparation, indent=2), flush=True)
+    if args.prepare_only:
+        print('PREPARE-ONLY complete; no model loaded.', flush=True)
+        return
+
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, Dataset
+    from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, get_linear_schedule_with_warmup
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA GPU required')
+    if args.dtype == 'bfloat16' and not torch.cuda.is_bf16_supported():
+        raise RuntimeError('GPU lacks BF16 support; use --dtype float16')
+    dtype = torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision, padding_side='right')
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    class TextDataset(Dataset):
+        def __init__(self, items):
+            self.items = items
+        def __len__(self): return len(self.items)
+        def __getitem__(self, index):
+            row = self.items[index]
+            text = tokenizer.apply_chat_template(
+                [{'role': 'system', 'content': SYSTEM_PROMPT},
+                 {'role': 'user', 'content': row['transcript_text']}],
+                tokenize=False, add_generation_prompt=False, enable_thinking=False)
+            tokenized = tokenizer(text, add_special_tokens=False, truncation=False)
+            if len(tokenized['input_ids']) > args.max_length:
+                raise ValueError(f"{row['segment_uid']} has {len(tokenized['input_ids'])} tokens; exceeds --max-length")
+            return {'input_ids': tokenized['input_ids'], 'attention_mask': tokenized['attention_mask'],
+                    'target': row['_target'], 'row': row}
+
+    def collate(batch):
+        width = max(len(item['input_ids']) for item in batch)
+        ids, masks = [], []
+        for item in batch:
+            pad = width-len(item['input_ids'])
+            ids.append(item['input_ids']+[tokenizer.pad_token_id]*pad)
+            masks.append(item['attention_mask']+[0]*pad)
+        return {'input_ids': torch.tensor(ids), 'attention_mask': torch.tensor(masks),
+                'targets': torch.tensor([item['target'] for item in batch], dtype=torch.float32),
+                'rows': [item['row'] for item in batch]}
+
+    quant = None
+    if not args.no_4bit:
+        quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type='nf4',
+                                   bnb_4bit_compute_dtype=dtype, bnb_4bit_use_double_quant=True)
+    base = AutoModel.from_pretrained(args.model, revision=args.revision, torch_dtype=dtype,
+                                     quantization_config=quant, device_map={'': 0},
+                                     attn_implementation=args.attention)
+    if quant is not None:
+        base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=args.gradient_checkpointing)
+    elif args.gradient_checkpointing:
+        base.gradient_checkpointing_enable(); base.enable_input_require_grads()
+    lora = LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                      bias='none', task_type='FEATURE_EXTRACTION',
+                      target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'])
+    base = get_peft_model(base, lora)
+    hidden_size = int(base.config.hidden_size)
+    head = nn.Sequential(nn.Dropout(args.head_dropout), nn.Linear(hidden_size, 1)).to('cuda:0', dtype=torch.float32)
+    base.print_trainable_parameters()
+
+    train_rows = [r for r in rows if r['split'] == 'train']; val_rows = [r for r in rows if r['split'] == 'val']
+    test_rows = [r for r in rows if r['split'] == 'test']
+    generator = torch.Generator().manual_seed(args.seed)
+    train_loader = DataLoader(TextDataset(train_rows), batch_size=args.batch_size, shuffle=True,
+                              generator=generator, collate_fn=collate)
+    val_loader = DataLoader(TextDataset(val_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+    test_loader = DataLoader(TextDataset(test_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+
+    parameters = [{'params': [p for p in base.parameters() if p.requires_grad], 'lr': args.learning_rate},
+                  {'params': head.parameters(), 'lr': args.head_learning_rate}]
+    optimizer = torch.optim.AdamW(parameters, weight_decay=args.weight_decay)
+    updates = math.ceil(len(train_loader)/args.grad_accum)*args.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(updates*args.warmup_ratio), updates)
+    if args.mode in {'consensus', 'soft'}:
+        positives = sum(r['_target'] for r in train_rows); negatives = len(train_rows)-positives
+        pos_weight = torch.tensor([negatives/max(positives, 1)], device='cuda:0')
+    else:
+        pos_weight = None
+    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight); huber = nn.SmoothL1Loss(beta=args.huber_beta)
+
+    def forward(batch):
+        ids=batch['input_ids'].to('cuda:0'); mask=batch['attention_mask'].to('cuda:0')
+        hidden=base(input_ids=ids, attention_mask=mask, return_dict=True).last_hidden_state
+        weights=mask.unsqueeze(-1).to(hidden.dtype); pooled=(hidden*weights).sum(1)/weights.sum(1).clamp_min(1)
+        return head(pooled.float()).squeeze(-1)
+
+    @torch.no_grad()
+    def evaluate(loader):
+        base.eval(); head.eval(); records=[]
+        for batch in loader:
+            raw=forward(batch); values=(raw.clamp(1,5) if args.mode=='regression' else torch.sigmoid(raw)).cpu().numpy()
+            for row, value in zip(batch['rows'], values):
+                records.append({**{k: row.get(k) for k in ('segment_uid','patient_id','session_id','segment_id','split','transcript_provider')},
+                                'WD_P_rater1': row['WD_P_rater1'], 'WD_P_rater2': row['WD_P_rater2'],
+                                'WD_P_mean': row['WD_P_mean'], 'WD_soft': row['WD_soft'],
+                                'WD_consensus': row.get('WD_consensus'),
+                                ('WD_prediction' if args.mode=='regression' else 'WD_probability'): float(value)})
+        if args.mode == 'regression':
+            metric=regression_metrics([r['WD_P_mean'] for r in records], [r['WD_prediction'] for r in records])
+        else:
+            consensus=[r for r in records if finite(r.get('WD_consensus'))]
+            metric=binary_metrics([int(float(r['WD_consensus'])) for r in consensus],
+                                  [r['WD_probability'] for r in consensus], 0.5)
+        return metric, records
+
+    best_score=-float('inf'); best_state=None; history=[]
+    optimizer.zero_grad(set_to_none=True)
+    for epoch in range(1,args.epochs+1):
+        base.train(); head.train(); running=0.0
+        for step,batch in enumerate(train_loader,1):
+            targets=batch['targets'].to('cuda:0'); raw=forward(batch)
+            loss=(huber(raw,targets) if args.mode=='regression' else bce(raw,targets))/args.grad_accum
+            loss.backward(); running+=float(loss.detach().cpu())*args.grad_accum
+            if step%args.grad_accum==0 or step==len(train_loader):
+                torch.nn.utils.clip_grad_norm_([p for p in base.parameters() if p.requires_grad]+list(head.parameters()),args.max_grad_norm)
+                optimizer.step(); scheduler.step(); optimizer.zero_grad(set_to_none=True)
+        val_metric,_=evaluate(val_loader)
+        selection=(-val_metric['mae'] if args.mode=='regression' else (val_metric['auprc'] or -1))
+        history.append({'epoch':epoch,'train_loss':running/len(train_loader),**{f'val_{k}':v for k,v in val_metric.items()}})
+        print(json.dumps(history[-1]),flush=True)
+        if selection>best_score:
+            best_score=selection
+            best_state={'base':{n:p.detach().cpu().clone() for n,p in base.named_parameters() if p.requires_grad},
+                        'head':{n:p.detach().cpu().clone() for n,p in head.named_parameters()}}
+    if best_state is None: raise RuntimeError('No checkpoint selected')
+    with torch.no_grad():
+        for n,p in base.named_parameters():
+            if n in best_state['base']: p.copy_(best_state['base'][n].to(p.device,p.dtype))
+        for n,p in head.named_parameters(): p.copy_(best_state['head'][n].to(p.device,p.dtype))
+    val_metric,val_predictions=evaluate(val_loader); test_metric,test_predictions=evaluate(test_loader)
+    import pandas as pd
+    pd.DataFrame(history).to_csv(output/'training_history.csv',index=False)
+    pd.DataFrame(val_predictions).to_csv(output/'val_predictions.csv',index=False,encoding='utf-8-sig')
+    pd.DataFrame(test_predictions).to_csv(output/'test_predictions.csv',index=False,encoding='utf-8-sig')
+    base.save_pretrained(output/'best_adapter'); tokenizer.save_pretrained(output/'best_adapter')
+    torch.save(head.state_dict(),output/'best_head.pt')
+    summary={'mode':args.mode,'selection_metric':'val_mae' if args.mode=='regression' else 'val_consensus_auprc',
+             'fixed_probability_threshold':None if args.mode=='regression' else 0.5,
+             'val_metrics':val_metric,'test_metrics':test_metric,'row_counts':counts,'patient_disjoint':True}
+    (output/'final_summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
+    print(json.dumps(summary,indent=2),flush=True)
+
+
+if __name__ == '__main__':
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--dataset',type=Path,required=True); p.add_argument('--mode',choices=['regression','consensus','soft'],required=True)
+    p.add_argument('--output',type=Path,required=True); p.add_argument('--model',default='Qwen/Qwen3-8B'); p.add_argument('--revision',default='main')
+    p.add_argument('--dtype',choices=['bfloat16','float16'],default='bfloat16'); p.add_argument('--no-4bit',action='store_true')
+    p.add_argument('--attention',choices=['sdpa','eager','flash_attention_2'],default='sdpa'); p.add_argument('--max-length',type=int,default=2048)
+    p.add_argument('--batch-size',type=int,default=1); p.add_argument('--eval-batch-size',type=int,default=2); p.add_argument('--grad-accum',type=int,default=8)
+    p.add_argument('--epochs',type=int,default=2); p.add_argument('--learning-rate',type=float,default=5e-5); p.add_argument('--head-learning-rate',type=float,default=1e-4)
+    p.add_argument('--weight-decay',type=float,default=.01); p.add_argument('--warmup-ratio',type=float,default=.05); p.add_argument('--max-grad-norm',type=float,default=1.0)
+    p.add_argument('--lora-rank',type=int,default=8); p.add_argument('--lora-alpha',type=int,default=16); p.add_argument('--lora-dropout',type=float,default=.05)
+    p.add_argument('--head-dropout',type=float,default=.1); p.add_argument('--huber-beta',type=float,default=.5)
+    p.add_argument('--gradient-checkpointing',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--seed',type=int,default=42)
+    p.add_argument('--prepare-only',action='store_true'); main(p.parse_args())
