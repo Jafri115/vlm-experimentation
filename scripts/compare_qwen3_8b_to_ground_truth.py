@@ -266,7 +266,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--predictions', type=Path)
-    parser.add_argument('--annotations', type=Path, default=ROOT.parent/'facs-openface-tools/data/completed_segments_merged (1).csv')
+    parser.add_argument('--annotations', type=Path, default=ROOT.parent/'VLM_experiments/data/completed_segments_merged (1).csv')
     parser.add_argument('--inventory', type=Path, default=ROOT/'data/amberscript_llm/inventory_all_segments.csv')
     parser.add_argument('--output', type=Path, default=ROOT/'output/qwen3_8b_ground_truth_comparison')
     main(parser.parse_args())
