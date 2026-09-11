@@ -61,3 +61,20 @@ affect results.
 The earlier GGUF/Vulkan runner and its partial local predictions are separate
 from this BF16 experiment. That local run has been stopped. This 32 GB runner has
 not been used for inference here.
+
+## Compare with human ground truth
+
+Copy the completed BF16 `predictions.csv` back to the same relative output path
+in this project, then run:
+
+```powershell
+python scripts/compare_qwen3_8b_to_ground_truth.py `
+  --predictions output/qwen3_8b_bf16_zeroshot/inventory_ready/predictions.csv
+```
+
+The primary four-class target follows the existing VLM convention:
+`mean(WD_P) > 1` and `mean(CF_P) > 1`. The comparison also reports a stricter
+two-or-more-rater consensus analysis, binary rupture metrics, WD and CF
+one-vs-rest metrics, confusion matrices, provider subgroups, and a row-level
+file of errors. Results are written to
+`output/qwen3_8b_ground_truth_comparison`.
