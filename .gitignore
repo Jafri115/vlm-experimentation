@@ -238,3 +238,7 @@ test_v8_1_qwen30_load.ps1
 *.ps1
 
 models/face_detection_yunet/face_detection_yunet_2026may.onnx
+
+# Downloaded local LLM weights and portable inference runtimes.
+/models/qwen3_8b/
+/models/llama_cpp_*/

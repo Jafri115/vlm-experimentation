@@ -1,0 +1,5 @@
+# Install the CUDA-enabled torch build appropriate for your machine first.
+torch>=2.6
+transformers>=4.51.0,<5
+accelerate>=1.2
+safetensors>=0.4
