@@ -1,8 +1,10 @@
 param(
     [string]$LlmPython = ".\.venv-llm-ft\Scripts\python.exe",
     [string]$VlmPython = ".\.venv\Scripts\python.exe",
-    [string]$VlmFrameCache = ".\output\qwen3vl_wd_planning196_thr2\qwen3vl_wd_planning196_thr2\frame_cache_16",
+    [string]$VlmFrameCache = ".\output\qwen3vl_wd_planning196_thr2\frame_cache_16",
+    [string]$MasterRoot = ".\output\wd_multimodal_master_repaired",
     [switch]$IncludeVlm,
+    [switch]$IncludeFewShot,
     [int[]]$Folds = @(1, 2, 3, 4, 5)
 )
 
@@ -21,6 +23,7 @@ function Resolve-ProjectPath([string]$PathValue) {
 $LlmPython = Resolve-ProjectPath $LlmPython
 $VlmPython = Resolve-ProjectPath $VlmPython
 $VlmFrameCache = Resolve-ProjectPath $VlmFrameCache
+$MasterRoot = Resolve-ProjectPath $MasterRoot
 if (-not (Test-Path -LiteralPath $LlmPython)) {
     $FallbackPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     if (Test-Path -LiteralPath $FallbackPython) {
@@ -143,6 +146,7 @@ Write-QueueMessage "WD overnight queue started"
 Write-QueueMessage "Project: $ProjectRoot"
 Write-QueueMessage "LLM Python: $LlmPython"
 Write-QueueMessage "Include VLM: $IncludeVlm"
+Write-QueueMessage "Master cohort: $MasterRoot"
 
 # Fail once with a clear message when the transferred experiment bundle is
 # incomplete, instead of producing the same traceback for every fold.
@@ -150,14 +154,15 @@ $RequiredCommon = @(
     "scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py",
     "scripts/run_qwen3_8b_wd_3rs_zeroshot.py",
     "scripts/finetune_qwen3_8b_wd_text.py",
+    "scripts/plot_wd_training_validation.py",
     "scripts/combine_wd_cv_predictions.py",
     "scripts/compare_vlm_llm_wd_predictions.py",
-    "output/wd_multimodal_master/frozen_rater_labels_long.csv"
+    (Join-Path $MasterRoot "frozen_rater_labels_long.csv")
 )
 foreach ($Fold in $Folds) {
-    $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/master_manifest.jsonl"
-    $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/master_manifest.csv"
-    $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/vlm_manifest.csv"
+    $RequiredCommon += (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl")
+    $RequiredCommon += (Join-Path $MasterRoot "fold_$Fold\master_manifest.csv")
+    $RequiredCommon += (Join-Path $MasterRoot "fold_$Fold\vlm_manifest.csv")
 }
 $MissingCommon = @(
     $RequiredCommon | Where-Object {
@@ -201,31 +206,33 @@ if ($IncludeVlm) {
         -Code "import torch, transformers, peft, bitsandbytes; from transformers import Qwen3VLForConditionalGeneration; assert torch.cuda.is_available(), 'CUDA unavailable'; print(torch.cuda.get_device_name(0)); print(transformers.__version__)"
 }
 
-# Generative transcript experiments: zero-shot followed by 3+3 few-shot.
+# Generative transcript experiment: zero-shot first.
 foreach ($Fold in $Folds) {
     Invoke-QueuedJob `
         -Name "llm_zero_fold_$Fold" `
         -Python $LlmPython `
         -Arguments @(
             "scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py",
-            "--dataset", "output/wd_multimodal_master/fold_$Fold/master_manifest.jsonl",
+            "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
             "--shot", "zero",
-            "--output", "output/llm_wd_zero_cv/fold_$Fold"
+            "--output", "output/llm_wd_zero_repaired_cv/fold_$Fold"
         ) `
-        -CompletionFile "output/llm_wd_zero_cv/fold_$Fold/summary.json"
+        -CompletionFile "output/llm_wd_zero_repaired_cv/fold_$Fold/summary.json"
 }
 
+if ($IncludeFewShot) {
 foreach ($Fold in $Folds) {
     Invoke-QueuedJob `
         -Name "llm_few_3plus3_fold_$Fold" `
         -Python $LlmPython `
         -Arguments @(
             "scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py",
-            "--dataset", "output/wd_multimodal_master/fold_$Fold/master_manifest.jsonl",
+            "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
             "--shot", "few", "--examples-per-class", "3",
-            "--output", "output/llm_wd_few_cv/fold_$Fold"
+            "--output", "output/llm_wd_few_repaired_cv/fold_$Fold"
         ) `
-        -CompletionFile "output/llm_wd_few_cv/fold_$Fold/summary.json"
+        -CompletionFile "output/llm_wd_few_repaired_cv/fold_$Fold/summary.json"
+}
 }
 
 # QLoRA transcript experiments: regression, consensus binary, then soft labels.
@@ -236,11 +243,11 @@ foreach ($Mode in @("regression", "consensus", "soft")) {
             -Python $LlmPython `
             -Arguments @(
                 "scripts/finetune_qwen3_8b_wd_text.py",
-                "--dataset", "output/wd_multimodal_master/fold_$Fold/master_manifest.jsonl",
+                "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
                 "--mode", $Mode,
-                "--output", "output/llm_wd_${Mode}_cv/fold_$Fold"
+                "--output", "output/llm_wd_${Mode}_repaired_cv/fold_$Fold"
             ) `
-            -CompletionFile "output/llm_wd_${Mode}_cv/fold_$Fold/final_summary.json"
+            -CompletionFile "output/llm_wd_${Mode}_repaired_cv/fold_$Fold/final_summary.json"
     }
 }
 
@@ -253,21 +260,21 @@ if ($IncludeVlm) {
                 -Python $VlmPython `
                 -Arguments @(
                     "scripts/finetune_qwen3vl_wd_consensus_binary.py",
-                    "--labels-csv", "output/wd_multimodal_master/frozen_rater_labels_long.csv",
-                    "--manifest", "output/wd_multimodal_master/fold_$Fold/vlm_manifest.csv",
+                    "--labels-csv", (Join-Path $MasterRoot "frozen_rater_labels_long.csv"),
+                    "--manifest", (Join-Path $MasterRoot "fold_$Fold\vlm_manifest.csv"),
                     "--target-mode", $Mode,
                     "--positive-threshold", "2",
                     "--frame-cache", $VlmFrameCache,
-                    "--output-dir", "output/vlm_wd_${Mode}_paired_cv/fold_$Fold"
+                    "--output-dir", "output/vlm_wd_${Mode}_repaired_paired_cv/fold_$Fold"
                 ) `
-                -CompletionFile "output/vlm_wd_${Mode}_paired_cv/fold_$Fold/final_summary.json"
+                -CompletionFile "output/vlm_wd_${Mode}_repaired_paired_cv/fold_$Fold/final_summary.json"
         }
     }
 }
 
 # Out-of-fold aggregation. Prompting scripts call their file predictions.csv;
 # fine-tuning scripts call it test_predictions.csv.
-foreach ($PromptRoot in @("llm_wd_zero_cv", "llm_wd_few_cv")) {
+foreach ($PromptRoot in @("llm_wd_zero_repaired_cv", "llm_wd_few_repaired_cv")) {
     if (Test-AllFoldFiles "output/$PromptRoot" "predictions.csv") {
         Invoke-QueuedJob `
             -Name "combine_$PromptRoot" `
@@ -283,8 +290,8 @@ foreach ($PromptRoot in @("llm_wd_zero_cv", "llm_wd_few_cv")) {
 }
 
 foreach ($ModelRoot in @(
-    "llm_wd_regression_cv", "llm_wd_consensus_cv", "llm_wd_soft_cv",
-    "vlm_wd_consensus_paired_cv", "vlm_wd_soft_paired_cv"
+    "llm_wd_regression_repaired_cv", "llm_wd_consensus_repaired_cv", "llm_wd_soft_repaired_cv",
+    "vlm_wd_consensus_repaired_paired_cv", "vlm_wd_soft_repaired_paired_cv"
 )) {
     if (Test-AllFoldFiles "output/$ModelRoot" "test_predictions.csv") {
         Invoke-QueuedJob `
@@ -299,10 +306,24 @@ foreach ($ModelRoot in @(
     }
 }
 
+# Training curves are generated after all fold jobs finish. Existing model
+# scripts write training_history.csv (LLM) and learning_curves.csv (VLM).
+$PlotPython = if ($IncludeVlm) { $VlmPython } else { $LlmPython }
+Invoke-QueuedJob `
+    -Name "plot_wd_training_validation" `
+    -Python $PlotPython `
+    -Arguments @(
+        "scripts/plot_wd_training_validation.py",
+        "--root", "output",
+        "--output", "output/wd_training_plots_repaired",
+        "--suffix", "_repaired"
+    ) `
+    -CompletionFile "output/wd_training_plots_repaired/llm_consensus_train_validation.png"
+
 if ($IncludeVlm) {
     foreach ($Mode in @("consensus", "soft")) {
-        $VlmPredictions = "output/vlm_wd_${Mode}_paired_cv/oof_predictions.csv"
-        $LlmPredictions = "output/llm_wd_${Mode}_cv/oof_predictions.csv"
+        $VlmPredictions = "output/vlm_wd_${Mode}_repaired_paired_cv/oof_predictions.csv"
+        $LlmPredictions = "output/llm_wd_${Mode}_repaired_cv/oof_predictions.csv"
         if ((Test-Path -LiteralPath (Resolve-ProjectPath $VlmPredictions)) -and
             (Test-Path -LiteralPath (Resolve-ProjectPath $LlmPredictions))) {
             Invoke-QueuedJob `
@@ -312,9 +333,10 @@ if ($IncludeVlm) {
                     "scripts/compare_vlm_llm_wd_predictions.py",
                     "--vlm-predictions", $VlmPredictions,
                     "--llm-predictions", $LlmPredictions,
-                    "--output", "output/paired_comparison_$Mode"
+                    "--vlm-threshold-column", "fold_selected_threshold",
+                    "--output", "output/paired_comparison_${Mode}_repaired"
                 ) `
-                -CompletionFile "output/paired_comparison_$Mode/comparison_summary.json"
+                -CompletionFile "output/paired_comparison_${Mode}_repaired/comparison_summary.json"
         }
     }
 }
