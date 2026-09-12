@@ -30,8 +30,7 @@ from build_llm_wd_aligned_dataset import (
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = (
-    ROOT
-    / "output/qwen3vl_wd_planning196_thr2/qwen3vl_wd_planning196_thr2"
+    ROOT / "output/qwen3vl_wd_planning196_thr2"
 )
 
 
