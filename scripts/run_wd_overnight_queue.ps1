@@ -72,8 +72,23 @@ function Invoke-QueuedJob {
 
     Write-QueueMessage "START $Name"
     "COMMAND: $Python $($Arguments -join ' ')" | Out-File -LiteralPath $LogPath -Encoding utf8
-    & $Python @Arguments *>> $LogPath
-    $ExitCode = $LASTEXITCODE
+    # Windows PowerShell can promote any native stderr output to a terminating
+    # NativeCommandError when the queue uses ErrorActionPreference=Stop. Model
+    # libraries routinely write progress and warnings to stderr, so temporarily
+    # use Continue, capture both streams in the job log, and decide success from
+    # the native exit code plus the expected completion artifact.
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ExitCode = 1
+    try {
+        $ErrorActionPreference = "Continue"
+        & $Python @Arguments *>> $LogPath
+        $ExitCode = $LASTEXITCODE
+    } catch {
+        $_ | Out-String | Out-File -LiteralPath $LogPath -Append -Encoding utf8
+        $ExitCode = 1
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
     $Finished = Get-Date
     $Status = if ($ExitCode -eq 0 -and (Test-Path -LiteralPath $CompletionFile)) {
         "COMPLETED"
