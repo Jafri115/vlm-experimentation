@@ -13,11 +13,18 @@ function Resolve-ProjectPath([string]$PathValue) {
     if ([System.IO.Path]::IsPathRooted($PathValue)) {
         return [System.IO.Path]::GetFullPath($PathValue)
     }
-    return [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $PathValue))
+    $Relative = $PathValue -replace '^[.][\\/]', ''
+    return [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $Relative))
 }
 
 $LlmPython = Resolve-ProjectPath $LlmPython
 $VlmPython = Resolve-ProjectPath $VlmPython
+if (-not (Test-Path -LiteralPath $LlmPython)) {
+    $FallbackPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $FallbackPython) {
+        $LlmPython = $FallbackPython
+    }
+}
 if (-not (Test-Path -LiteralPath $LlmPython)) {
     throw "LLM Python executable not found: $LlmPython"
 }
@@ -217,4 +224,3 @@ if ($IncludeVlm) {
 }
 
 Write-QueueMessage "WD overnight queue finished"
-

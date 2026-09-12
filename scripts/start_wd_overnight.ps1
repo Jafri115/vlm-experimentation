@@ -10,6 +10,29 @@ $QueueScript = Join-Path $PSScriptRoot "run_wd_overnight_queue.ps1"
 $RunRoot = Join-Path $ProjectRoot "output\wd_overnight_queue"
 New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
 
+function Resolve-LauncherPath([string]$PathValue) {
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+    $Relative = $PathValue -replace '^[.][\\/]', ''
+    return [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot $Relative))
+}
+
+$LlmPython = Resolve-LauncherPath $LlmPython
+$VlmPython = Resolve-LauncherPath $VlmPython
+if (-not (Test-Path -LiteralPath $LlmPython)) {
+    $FallbackPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $FallbackPython) {
+        $LlmPython = $FallbackPython
+    }
+}
+if (-not (Test-Path -LiteralPath $LlmPython)) {
+    throw "LLM Python executable not found. Checked $LlmPython and .venv\Scripts\python.exe"
+}
+if ($IncludeVlm -and -not (Test-Path -LiteralPath $VlmPython)) {
+    throw "VLM Python executable not found: $VlmPython"
+}
+
 $Arguments = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
