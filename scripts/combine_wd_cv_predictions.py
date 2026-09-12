@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -25,6 +26,12 @@ def main(args) -> None:
     for path in paths:
         frame = pd.read_csv(path, encoding="utf-8-sig")
         frame["outer_fold"] = fold_number(path)
+        summary_path = path.parent / "final_summary.json"
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            selected = summary.get("selected_probability_threshold")
+            if selected is not None:
+                frame["fold_selected_threshold"] = float(selected)
         frames.append(frame)
     combined = pd.concat(frames, ignore_index=True)
     identifier = "segment_uid" if "segment_uid" in combined else "sample_id"
