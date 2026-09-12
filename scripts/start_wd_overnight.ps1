@@ -11,6 +11,21 @@ $QueueScript = Join-Path $PSScriptRoot "run_wd_overnight_queue.ps1"
 $RunRoot = Join-Path $ProjectRoot "output\wd_overnight_queue"
 New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
 
+# Prevent concurrent queues from training on the same GPU and writing the
+# same checkpoints/logs. This checks the actual command line instead of only
+# trusting a possibly stale PID file.
+$ExistingQueues = @(
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
+        Where-Object {
+            $_.ProcessId -ne $PID -and
+            $_.CommandLine -like "*run_wd_overnight_queue.ps1*"
+        }
+)
+if ($ExistingQueues.Count -gt 0) {
+    $Ids = ($ExistingQueues.ProcessId -join ", ")
+    throw "An overnight WD queue is already running (PID: $Ids). Monitor it instead of starting a second queue."
+}
+
 function Resolve-LauncherPath([string]$PathValue) {
     if ([System.IO.Path]::IsPathRooted($PathValue)) {
         return [System.IO.Path]::GetFullPath($PathValue)
@@ -47,11 +62,21 @@ if ($IncludeVlm) {
     $Arguments += "-IncludeVlm"
 }
 
+# Start-Process serializes an argument array inconsistently in Windows
+# PowerShell when path arguments contain backslashes. Quote each argument as
+# one Windows command-line token, preserving the separator before `.venv`.
+function ConvertTo-CommandLineToken([string]$Value) {
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+$ArgumentLine = ($Arguments | ForEach-Object {
+    ConvertTo-CommandLineToken ([string]$_)
+}) -join " "
+
 $Stdout = Join-Path $RunRoot "launcher.stdout.log"
 $Stderr = Join-Path $RunRoot "launcher.stderr.log"
 $Process = Start-Process `
     -FilePath "powershell.exe" `
-    -ArgumentList $Arguments `
+    -ArgumentList $ArgumentLine `
     -WorkingDirectory $ProjectRoot `
     -WindowStyle Hidden `
     -RedirectStandardOutput $Stdout `
