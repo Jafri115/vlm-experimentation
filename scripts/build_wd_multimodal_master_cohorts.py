@@ -317,6 +317,14 @@ def main(args) -> None:
     )
 
     fold_summaries = []
+    # The legacy VLM trainer rebuilds these target columns from a long-form
+    # ratings CSV. Supplying a manifest that already has them creates pandas
+    # _x/_y suffixes and breaks that merge. The LLM manifest retains them.
+    vlm_target_columns = {
+        "coder_1", "coder_2", "WD_P_rater1", "WD_P_rater2", "WD_P_mean",
+        "WD_hard_mean", "WD_soft", "WD_consensus", "WD_binary_disagreement",
+        "WD_absolute_rater_difference",
+    }
     all_patients = sorted(paired["patient_id"].astype(str).unique())
     for fold in range(1, args.cv_folds + 1):
         test = sorted(patient for patient, value in assignments.items() if value == fold)
@@ -330,6 +338,12 @@ def main(args) -> None:
         fold_dir = args.output / f"fold_{fold}"
         fold_dir.mkdir(parents=True, exist_ok=True)
         write_table(fold_frame, fold_dir / "master_manifest.csv")
+        vlm_manifest = fold_frame.drop(
+            columns=[column for column in vlm_target_columns if column in fold_frame.columns]
+        )
+        vlm_manifest.to_csv(
+            fold_dir / "vlm_manifest.csv", index=False, encoding="utf-8-sig"
+        )
         write_table(
             fold_frame[fold_frame["WD_consensus"].notna()].copy(),
             fold_dir / "consensus_manifest.csv",

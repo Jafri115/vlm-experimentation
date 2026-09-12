@@ -157,6 +157,7 @@ $RequiredCommon = @(
 foreach ($Fold in $Folds) {
     $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/master_manifest.jsonl"
     $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/master_manifest.csv"
+    $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/vlm_manifest.csv"
 }
 $MissingCommon = @(
     $RequiredCommon | Where-Object {
@@ -253,7 +254,7 @@ if ($IncludeVlm) {
                 -Arguments @(
                     "scripts/finetune_qwen3vl_wd_consensus_binary.py",
                     "--labels-csv", "output/wd_multimodal_master/frozen_rater_labels_long.csv",
-                    "--manifest", "output/wd_multimodal_master/fold_$Fold/master_manifest.csv",
+                    "--manifest", "output/wd_multimodal_master/fold_$Fold/vlm_manifest.csv",
                     "--target-mode", $Mode,
                     "--positive-threshold", "2",
                     "--frame-cache", $VlmFrameCache,
