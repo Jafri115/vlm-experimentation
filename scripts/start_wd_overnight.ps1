@@ -1,6 +1,7 @@
 param(
     [string]$LlmPython = ".\.venv-llm-ft\Scripts\python.exe",
     [string]$VlmPython = ".\.venv\Scripts\python.exe",
+    [string]$VlmFrameCache = ".\output\qwen3vl_wd_planning196_thr2\qwen3vl_wd_planning196_thr2\frame_cache_16",
     [switch]$IncludeVlm
 )
 
@@ -20,6 +21,7 @@ function Resolve-LauncherPath([string]$PathValue) {
 
 $LlmPython = Resolve-LauncherPath $LlmPython
 $VlmPython = Resolve-LauncherPath $VlmPython
+$VlmFrameCache = Resolve-LauncherPath $VlmFrameCache
 if (-not (Test-Path -LiteralPath $LlmPython)) {
     $FallbackPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     if (Test-Path -LiteralPath $FallbackPython) {
@@ -38,7 +40,8 @@ $Arguments = @(
     "-ExecutionPolicy", "Bypass",
     "-File", $QueueScript,
     "-LlmPython", $LlmPython,
-    "-VlmPython", $VlmPython
+    "-VlmPython", $VlmPython,
+    "-VlmFrameCache", $VlmFrameCache
 )
 if ($IncludeVlm) {
     $Arguments += "-IncludeVlm"

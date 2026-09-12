@@ -1,6 +1,7 @@
 param(
     [string]$LlmPython = ".\.venv-llm-ft\Scripts\python.exe",
     [string]$VlmPython = ".\.venv\Scripts\python.exe",
+    [string]$VlmFrameCache = ".\output\qwen3vl_wd_planning196_thr2\qwen3vl_wd_planning196_thr2\frame_cache_16",
     [switch]$IncludeVlm,
     [int[]]$Folds = @(1, 2, 3, 4, 5)
 )
@@ -19,6 +20,7 @@ function Resolve-ProjectPath([string]$PathValue) {
 
 $LlmPython = Resolve-ProjectPath $LlmPython
 $VlmPython = Resolve-ProjectPath $VlmPython
+$VlmFrameCache = Resolve-ProjectPath $VlmFrameCache
 if (-not (Test-Path -LiteralPath $LlmPython)) {
     $FallbackPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     if (Test-Path -LiteralPath $FallbackPython) {
@@ -115,10 +117,88 @@ function Test-AllFoldFiles([string]$Root, [string]$Filename) {
     return $true
 }
 
+function Test-PythonEnvironment {
+    param(
+        [string]$Name,
+        [string]$Python,
+        [string]$Code
+    )
+    $LogPath = Join-Path $LogRoot ("preflight_" + $Name + ".log")
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $Python "-c" $Code *>> $LogPath
+        $ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+    if ($ExitCode -ne 0) {
+        Write-QueueMessage "PREFLIGHT FAILED: $Name Python environment; see $LogPath"
+        throw "$Name Python environment preflight failed"
+    }
+    Write-QueueMessage "Preflight $Name Python environment passed"
+}
+
 Write-QueueMessage "WD overnight queue started"
 Write-QueueMessage "Project: $ProjectRoot"
 Write-QueueMessage "LLM Python: $LlmPython"
 Write-QueueMessage "Include VLM: $IncludeVlm"
+
+# Fail once with a clear message when the transferred experiment bundle is
+# incomplete, instead of producing the same traceback for every fold.
+$RequiredCommon = @(
+    "scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py",
+    "scripts/run_qwen3_8b_wd_3rs_zeroshot.py",
+    "scripts/finetune_qwen3_8b_wd_text.py",
+    "scripts/combine_wd_cv_predictions.py",
+    "scripts/compare_vlm_llm_wd_predictions.py",
+    "output/wd_multimodal_master/frozen_rater_labels_long.csv"
+)
+foreach ($Fold in $Folds) {
+    $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/master_manifest.jsonl"
+    $RequiredCommon += "output/wd_multimodal_master/fold_$Fold/master_manifest.csv"
+}
+$MissingCommon = @(
+    $RequiredCommon | Where-Object {
+        -not (Test-Path -LiteralPath (Resolve-ProjectPath $_))
+    }
+)
+if ($MissingCommon.Count -gt 0) {
+    Write-QueueMessage "PREFLIGHT FAILED: missing required files"
+    $MissingCommon | ForEach-Object { Write-QueueMessage "MISSING $_" }
+    throw "Overnight experiment bundle is incomplete. See $QueueLog"
+}
+
+if ($IncludeVlm) {
+    $RequiredVlm = @(
+        "scripts/finetune_qwen3vl_wd_consensus_binary.py",
+        "scripts/finetune_qwen3vl_rupture_pilot.py",
+        $VlmFrameCache
+    )
+    $MissingVlm = @(
+        $RequiredVlm | Where-Object {
+            -not (Test-Path -LiteralPath (Resolve-ProjectPath $_))
+        }
+    )
+    if ($MissingVlm.Count -gt 0) {
+        Write-QueueMessage "VLM DISABLED: missing VLM files"
+        $MissingVlm | ForEach-Object { Write-QueueMessage "MISSING $_" }
+        Write-QueueMessage "LLM experiments will continue; restart with -IncludeVlm after supplying the cache"
+        $IncludeVlm = $false
+    }
+}
+
+Write-QueueMessage "Preflight files passed"
+Test-PythonEnvironment `
+    -Name "llm" `
+    -Python $LlmPython `
+    -Code "import torch, transformers, peft, bitsandbytes; assert torch.cuda.is_available(), 'CUDA unavailable'; assert torch.cuda.is_bf16_supported(), 'BF16 unsupported'; print(torch.cuda.get_device_name(0)); print(transformers.__version__)"
+if ($IncludeVlm) {
+    Test-PythonEnvironment `
+        -Name "vlm" `
+        -Python $VlmPython `
+        -Code "import torch, transformers, peft, bitsandbytes; from transformers import Qwen3VLForConditionalGeneration; assert torch.cuda.is_available(), 'CUDA unavailable'; print(torch.cuda.get_device_name(0)); print(transformers.__version__)"
+}
 
 # Generative transcript experiments: zero-shot followed by 3+3 few-shot.
 foreach ($Fold in $Folds) {
@@ -176,7 +256,7 @@ if ($IncludeVlm) {
                     "--manifest", "output/wd_multimodal_master/fold_$Fold/master_manifest.csv",
                     "--target-mode", $Mode,
                     "--positive-threshold", "2",
-                    "--frame-cache", "output/qwen3vl_wd_planning196_thr2/qwen3vl_wd_planning196_thr2/frame_cache_16",
+                    "--frame-cache", $VlmFrameCache,
                     "--output-dir", "output/vlm_wd_${Mode}_paired_cv/fold_$Fold"
                 ) `
                 -CompletionFile "output/vlm_wd_${Mode}_paired_cv/fold_$Fold/final_summary.json"
