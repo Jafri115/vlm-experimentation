@@ -154,6 +154,27 @@ def build_manifest(args):
     return m
 
 
+def load_fixed_manifest(path):
+    """Load an existing patient-disjoint master manifest without resplitting."""
+    m = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+    required = {"sample_id", "split", "patient_id", "WD_P_mean", "video_path", "patient_side"}
+    missing = required - set(m.columns)
+    if missing:
+        raise ValueError(f"Fixed manifest missing columns: {sorted(missing)}")
+    m["split"] = m["split"].astype(str).str.lower().str.strip()
+    if not set(m["split"]).issubset({"train", "val", "test"}):
+        raise ValueError("Fixed manifest split must contain only train/val/test")
+    m["WD_P_mean"] = pd.to_numeric(m["WD_P_mean"], errors="raise")
+    if "segment_id" not in m and "segment_number" in m:
+        m["segment_id"] = pd.to_numeric(m["segment_number"], errors="raise")
+    print("\nLOADED FIXED PATIENT-DISJOINT MANIFEST:", path)
+    print(m.groupby("split").agg(segments=("sample_id", "size"), patients=("patient_id", "nunique")))
+    patient_sets = [set(m.loc[m.split == s, "patient_id"].astype(str)) for s in ("train", "val", "test")]
+    if any(patient_sets[i] & patient_sets[j] for i in range(3) for j in range(i + 1, 3)):
+        raise ValueError("Fixed manifest is not patient-disjoint")
+    return m
+
+
 def prepare_inputs(processor, frames: Sequence[Image.Image], device):
     content = [{"type":"image","image":f} for f in frames]
     content.append({"type":"text","text":WD_PROMPT})
@@ -299,7 +320,7 @@ def train(args, manifest):
 
 def parser():
     p=argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--labels-csv",required=True); p.add_argument("--video-root",default=r"C:\Data\Sequence_model\Memopsy_videos\CONVERTED")
+    p.add_argument("--labels-csv"); p.add_argument("--input-manifest",help="Existing train/val/test manifest; bypasses label aggregation and split generation."); p.add_argument("--video-root",default=r"C:\Data\Sequence_model\Memopsy_videos\CONVERTED")
     p.add_argument("--role-cache",default=r".\output\qwen3vl_visual_experiment_v5\patient_role_cache.json"); p.add_argument("--yunet-model",default=r".\models\face_detection_yunet\face_detection_yunet_2026may.onnx")
     p.add_argument("--manifest-out",default=r".\output\qwen3vl_wd_only_large\manifest.csv"); p.add_argument("--output-dir",default=r".\output\qwen3vl_wd_only_large\run1"); p.add_argument("--frame-cache",default=r".\output\qwen3vl_rupture_finetune_16f_stable\frame_cache_16")
     p.add_argument("--min-coders",type=int,default=2); p.add_argument("--positive-threshold",type=float,default=3.0); p.add_argument("--val-patients",type=int,default=2); p.add_argument("--test-patients",type=int,default=2)
@@ -314,7 +335,12 @@ def parser():
 def main():
     args=parser().parse_args(); args.max_val_examples=None if args.max_val_examples<=0 else args.max_val_examples; args.max_test_examples=None if args.max_test_examples<=0 else args.max_test_examples
     print("QWEN3-VL WD_P-ONLY LARGE-DATA QLORA\n"+"="*72); print("Labels:",args.labels_csv); print("Video root:",args.video_root); print("Target: WD_P_mean only | pooling: mean_all")
-    m=build_manifest(args)
+    if args.input_manifest:
+        m=load_fixed_manifest(args.input_manifest)
+    else:
+        if not args.labels_csv:
+            raise SystemExit("Provide --input-manifest or --labels-csv")
+        m=build_manifest(args)
     if args.prepare_only: print("\nPREPARE-ONLY complete. No model loaded."); return
     train(args,m)
 
