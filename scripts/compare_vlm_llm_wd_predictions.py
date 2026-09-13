@@ -80,7 +80,9 @@ def main(args):
     for name,frame,column in [('VLM',vlm,args.vlm_probability_column),('LLM',llm,args.llm_probability_column)]:
         if column not in frame: raise ValueError(f'{name} predictions lack {column!r}')
         if frame.segment_uid.duplicated().any(): raise ValueError(f'{name} has duplicate segment IDs')
-    keep=['segment_uid',args.vlm_probability_column]
+    keep=['segment_uid', args.vlm_probability_column]
+    if args.vlm_threshold_column:
+        keep.append(args.vlm_threshold_column)
     vlm=vlm[keep].rename(columns={args.vlm_probability_column:'vlm_probability'})
     llm_truth='WD_consensus' if 'WD_consensus' in llm else args.truth_column
     required=['segment_uid',args.llm_probability_column,llm_truth,'patient_id']
