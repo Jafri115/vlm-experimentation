@@ -33,40 +33,71 @@ Transferred overnight summaries are under
 
 | Experiment | VLM | LLM | Paired comparison |
 |---|---|---|---|
-| Zero-shot WD_P | Not run on this cohort | Complete: 1,734/1,734 predictions | Pending VLM run |
-| 3+3 few-shot WD_P | Not run on this cohort | Not run on this cohort | Not available |
-| Continuous WD_P regression | Not run on this cohort | Complete: five folds | Pending VLM run |
+| Zero-shot WD_P | Complete: 1,734/1,734 | Complete: 1,734/1,734 | Aggregate comparison complete; paired test needs OOF rows |
+| 3+3 few-shot WD_P | Complete: 1,734/1,734 | Complete: 1,720/1,734 | Aggregate comparison complete on unequal successful rows |
+| Continuous WD_P regression | Complete: five folds | Complete: five folds | Aggregate comparison complete; paired test needs OOF rows |
 | Consensus binary fine-tuning | Complete: five folds | Complete: five folds | **Complete** |
 | Soft-label fine-tuning | Complete: five folds | Complete: five folds | **Complete** |
 | Training/validation curves | Complete | Complete | Available in transferred results |
 
-## LLM zero-shot
+## Headline comparison
 
-Fold confusion matrices were pooled over all outer test folds. All selected rows
-were predicted successfully.
+### Continuous regression
 
-| N | Accuracy | Balanced accuracy | Precision | Recall | Specificity | F1 | Predicted positive rate |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1,734 | 0.653 | 0.621 | 0.668 | 0.811 | 0.432 | 0.732 | 0.710 |
+| Model | Input | Training N per fold | OOF evaluation N | MAE | RMSE | Fold-weighted Spearman |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3-VL | Patient-only video | 1,259–1,656 | 2,457 | 0.583 | **0.695** | 0.185 |
+| Qwen3-8B | Transcript | 1,259–1,656 | 2,457 | **0.568** | 0.710 | **0.225** |
 
-Counts: TP 822, TN 311, FP 409, FN 192.
+### Binary WD_P classification
 
-Zero-shot is essentially equal to consensus fine-tuning in balanced accuracy
-(0.6213 versus 0.6207) and slightly higher in F1 (0.7323 versus 0.7283). A
-formal paired test requires the row-level zero-shot predictions.
+| Experiment | Model | Input | Training N per fold | OOF evaluation N | Balanced accuracy |
+|---|---|---|---:|---:|---:|
+| Zero-shot | Qwen3-VL | Patient-only video | 0 | 1,734 | 0.498 |
+| Zero-shot | Qwen3-8B | Transcript | 0 | 1,734 | **0.621** |
+| 3+3 few-shot | Qwen3-VL | Patient-only video | 6 demonstrations | 1,734 | 0.417 |
+| 3+3 few-shot | Qwen3-8B | Transcript | 6 demonstrations | 1,720 | **0.596** |
+| Consensus fine-tuning | Qwen3-VL | Patient-only video | 857–1,201 | 1,734 | 0.574 |
+| Consensus fine-tuning | Qwen3-8B | Transcript | 857–1,201 | 1,734 | **0.621** |
+| Soft-label fine-tuning | Qwen3-VL | Patient-only video | 1,259–1,656 | 1,734 | 0.585 |
+| Soft-label fine-tuning | Qwen3-8B | Transcript | 1,259–1,656 | 1,734 | **0.615** |
 
-## LLM continuous regression
+## Zero-shot and 3+3 few-shot
+
+Fold confusion matrices were pooled over all outer test folds. Both zero-shot
+runs and VLM few-shot predicted every selected row. LLM few-shot had 14 errors.
+
+| Prompt | Modality | Successful/selected | Accuracy | Balanced accuracy | Precision | Recall | Specificity | F1 | Predicted positive rate |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Zero-shot | VLM | 1,734/1,734 | 0.414 | 0.498 | 0.250 | 0.001 | 0.996 | 0.002 | 0.002 |
+| Zero-shot | LLM | 1,734/1,734 | **0.653** | **0.621** | **0.668** | **0.811** | 0.432 | **0.732** | 0.710 |
+| 3+3 few-shot | VLM | 1,734/1,734 | 0.430 | 0.417 | 0.513 | 0.493 | 0.340 | 0.503 | 0.562 |
+| 3+3 few-shot | LLM | 1,720/1,734 | **0.601** | **0.596** | **0.673** | **0.625** | **0.567** | **0.648** | 0.546 |
+
+Zero-shot counts are VLM TP 1, TN 717, FP 3, FN 1,013 and LLM TP
+822, TN 311, FP 409, FN 192. The VLM zero-shot prompt almost always predicted
+negative. Demonstrations changed its output distribution but reduced balanced
+accuracy. LLM few-shot was also worse than LLM zero-shot.
+
+LLM zero-shot is essentially equal to LLM consensus fine-tuning in balanced
+accuracy (0.6213 versus 0.6207) and slightly higher in F1 (0.7323 versus
+0.7283). Formal paired prompt comparisons require row-level OOF predictions.
+
+## Continuous regression
 
 Pooled MAE and RMSE weight every outer-fold test row equally. Because the
 transferred bundle lacks row-level predictions, Spearman is the test-size-weighted
 mean of the five fold correlations.
 
-| Model | N | MAE | RMSE | Fold-weighted Spearman | True range | Predicted range | Prediction mean |
+| Modality | N | MAE | RMSE | Fold-weighted Spearman | True range | Predicted range | Prediction mean |
 |---|---:|---:|---:|---:|---|---|---:|
-| Qwen3-8B transcript | 2,457 | 0.568 | 0.710 | 0.225 | 1.0–4.5 | 1.00–2.24 | 1.641 |
+| Qwen3-VL video | 2,457 | 0.583 | **0.695** | 0.185 | 1.0–4.5 | 1.24–2.26 | 1.775 |
+| Qwen3-8B transcript | 2,457 | **0.568** | 0.710 | **0.225** | 1.0–4.5 | 1.00–2.24 | 1.641 |
 
-The transcript model compresses the human score range substantially. A direct
-modality comparison requires VLM regression on these same folds.
+Both modalities compress the human score range substantially. LLM has lower
+MAE and higher fold-weighted Spearman, while VLM has lower RMSE. Row-level
+predictions are needed for paired uncertainty estimates and one pooled
+Spearman correlation.
 
 ## Five-fold classification results
 
@@ -140,23 +171,26 @@ reduced specificity.
 
 ## Findings
 
-1. LLM zero-shot, consensus fine-tuning, and soft-label fine-tuning have similar
+1. LLM zero-shot is the strongest prompt result (balanced accuracy 0.621); VLM
+   zero-shot collapses almost entirely to the negative class (0.498).
+2. Adding 3+3 demonstrations does not improve either modality: VLM falls to
+   0.417 and LLM reaches 0.596 balanced accuracy.
+3. LLM zero-shot, consensus fine-tuning, and soft-label fine-tuning have similar
    balanced accuracy: 0.621, 0.621, and 0.615.
-2. Consensus VLM with `pos_weight=1` has high recall but low specificity and
+4. Consensus VLM with `pos_weight=1` has high recall but low specificity and
    predicts 79.2% of rows positive. The LLM has a more balanced error profile.
-3. Consensus F1 is nearly identical: 0.725 for VLM and 0.728 for LLM.
-4. Soft-label LLM point estimates exceed fixed-threshold VLM estimates for every
+5. Consensus F1 is nearly identical: 0.725 for VLM and 0.728 for LLM.
+6. Soft-label LLM point estimates exceed fixed-threshold VLM estimates for every
    reported metric.
-5. Patient-bootstrap intervals include zero for both paired comparisons, so the
+7. Patient-bootstrap intervals include zero for both fine-tuning comparisons, so the
    observed LLM advantages are not conclusive at the patient level.
-6. LLM regression still shows range compression and weak fold-weighted rank
-   correlation, supporting the binary WD_P formulation.
+8. Both regression models compress the score range. LLM has slightly lower MAE
+   and higher fold-weighted Spearman; VLM has slightly lower RMSE.
 
 ## Remaining work on this cohort
 
-- Run VLM zero-shot for a paired zero-shot modality comparison.
-- Run VLM regression for a paired continuous comparison.
-- Run 3+3 few-shot for both modalities only if that experiment is still needed.
-- Transfer row-level regression predictions for a pooled Spearman correlation
-  and patient-cluster confidence interval.
-
+- Transfer the zero-shot, few-shot, and regression OOF prediction CSVs for
+  exact paired tests, pooled regression correlation, and patient-cluster
+  confidence intervals.
+- Investigate the 14 failed LLM few-shot rows before treating the prompt
+  comparison as fully paired.

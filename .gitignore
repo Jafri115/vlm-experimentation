@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+!data/wd_ai_reliability_specs.json
 # C extensions
 *.so
 
@@ -240,7 +240,7 @@ test_v8_1_qwen30_load.ps1
 !scripts/collect_wd_overnight_results.ps1
 !scripts/run_wd_overnight_queue.ps1
 !scripts/start_wd_overnight.ps1
-
+!data/wd_ai_reliability_specs.json
 models/face_detection_yunet/face_detection_yunet_2026may.onnx
 
 # Downloaded local LLM weights and portable inference runtimes.

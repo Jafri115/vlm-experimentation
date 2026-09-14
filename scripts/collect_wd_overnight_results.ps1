@@ -36,7 +36,10 @@ try {
         "learning_curves.csv",
         "test_metrics.json",
         "metrics.json",
-        "regression_metrics.json"
+        "regression_metrics.json",
+        "oof_predictions.csv",
+        "predictions.csv",
+        "test_predictions.csv"
     )
 
     $collected = New-Object System.Collections.Generic.List[object]
