@@ -169,6 +169,97 @@ Changing to `pos_weight=1` raised balanced accuracy by 0.070 by greatly
 increasing sensitivity. It also caused many more positive predictions and
 reduced specificity.
 
+## AI treated as a third human rater
+
+Each analysis places human rater 1, human rater 2, and the AI output in a
+three-rater matrix. Ordinal AC2 uses quadratic weights on rounded 1–5 scores.
+`ICC(A,1)` is a two-way random-effects, absolute-agreement, single-rating ICC.
+For binary outputs, each human rating is converted with `WD_P >=2` and the AI
+probability is converted at 0.5. Binary AC2 uses the two-category agreement
+weights.
+
+### Ordinal 1–5 reliability
+
+Ordinal coefficients are available only when the model produced a 1–5 score.
+
+| Experiment | Model | N | Gwet AC2, quadratic | ICC(A,1), absolute agreement |
+|---|---|---:|---:|---:|
+| Zero-shot | Qwen3-VL | 1,734 | 0.796 | 0.253 |
+| Zero-shot | Qwen3-8B | 1,734 | **0.837** | **0.420** |
+| 3+3 few-shot | Qwen3-VL | 1,734 | 0.698 | 0.111 |
+| 3+3 few-shot | Qwen3-8B | 1,720 | **0.786** | **0.334** |
+| Regression | Qwen3-VL | 2,457 | 0.836 | 0.249 |
+| Regression | Qwen3-8B | 2,457 | **0.843** | **0.259** |
+
+### Binary reliability
+
+| Experiment | Model | N | Binary Gwet AC2 | Binary ICC(A,1) |
+|---|---|---:|---:|---:|
+| Zero-shot | Qwen3-VL | 1,734 | 0.254 | 0.292 |
+| Zero-shot | Qwen3-8B | 1,734 | **0.566** | **0.510** |
+| 3+3 few-shot | Qwen3-VL | 1,734 | 0.257 | 0.221 |
+| 3+3 few-shot | Qwen3-8B | 1,720 | **0.480** | **0.457** |
+| Regression | Qwen3-VL | 2,457 | **0.123** | **0.138** |
+| Regression | Qwen3-8B | 2,457 | 0.107 | 0.120 |
+| Consensus fine-tuning | Qwen3-VL | 2,457 | 0.303 | 0.211 |
+| Consensus fine-tuning | Qwen3-8B | 1,734 | **0.561** | **0.508** |
+| Soft-label fine-tuning | Qwen3-VL | 2,457 | 0.250 | 0.215 |
+| Soft-label fine-tuning | Qwen3-8B | 2,457 | **0.288** | **0.243** |
+
+The reliability populations differ because zero-shot and few-shot inference
+were restricted to consensus rows, regression and soft-label prediction cover
+the full 2,457 rows, and the saved consensus predictions do not cover the same
+population for both modalities. Therefore, compare VLM and LLM coefficients
+directly only when their `N` and included segment IDs match.
+
+The ordinal AC2 values are much higher than the ICC values because quadratic
+AC2 gives substantial credit to ratings that are only one category apart and
+is robust to skewed category prevalence. For example, VLM zero-shot almost
+always predicts score 1. That can remain close to many low human ratings and
+produce AC2 0.796, while its ICC of 0.253 and balanced accuracy of 0.498 reveal
+poor discrimination and weak absolute score agreement. Reliability coefficients
+must therefore be read alongside balanced accuracy, score spread, sensitivity,
+and specificity.
+
+### Human-rater reference
+
+| Population | N | Human–human ordinal AC2 | Human–human ordinal ICC(A,1) | Human–human binary AC2 | Human–human binary ICC(A,1) | Raw binary agreement |
+|---|---:|---:|---:|---:|---:|---:|
+| Full repaired cohort | 2,457 | 0.842 | 0.448 | 0.420 | 0.403 | 0.706 |
+| Consensus-only subset | 1,734 | 0.931 | 0.785 | 1.000 | 1.000 | 1.000 |
+
+The consensus-only human reliability of 1.0 is guaranteed by construction:
+these are precisely the rows where both humans fall on the same side of the
+binary threshold. It is not an independent estimate of ordinary human
+reliability. The full-cohort row is the meaningful human benchmark. On all
+2,457 rows, the humans disagree on the binary label in 723 cases (29.4%), so
+even human–human binary AC2 is only 0.420.
+
+### Simple interpretation
+
+Binary conversion makes a one-point difference decisive. Human scores 1 and 2
+are close on the five-point scale, but after thresholding they become opposite
+labels. This removes the partial credit used by quadratic ordinal AC2 and is
+the main reason binary AC2 is lower.
+
+The regression models add a second problem: their predicted scores are tightly
+compressed around roughly 1–2. Many rows consequently fall on the same side of
+the binary cutoff, producing binary AC2 near 0.1 even though ordinal AC2 remains
+high because the predicted scores are numerically close to common human scores.
+
+For direct interpretation:
+
+- Human–human reliability on the full cohort is moderate: binary AC2 0.420 and
+  ICC 0.403.
+- Soft-label VLM as a third rater is below that benchmark: AC2 0.250 and ICC 0.215.
+- Soft-label LLM is also below it but slightly closer: AC2 0.288 and ICC 0.243.
+- Regression AI outputs should be judged primarily with MAE, RMSE, Spearman,
+  and ordinal ICC. Their binary reliability is distorted by range compression.
+- Zero-shot and consensus results use the preselected consensus subset, where
+  the two humans already agree perfectly on the binary target. Their AI
+  reliability values therefore answer a narrower and easier question and
+  should not be compared directly with the full-cohort human benchmark.
+
 ## Findings
 
 1. LLM zero-shot is the strongest prompt result (balanced accuracy 0.621); VLM
@@ -186,6 +277,9 @@ reduced specificity.
    observed LLM advantages are not conclusive at the patient level.
 8. Both regression models compress the score range. LLM has slightly lower MAE
    and higher fold-weighted Spearman; VLM has slightly lower RMSE.
+9. Treating AI as a third rater favors the LLM for zero-shot and few-shot on
+   both ordinal and binary reliability. Regression ordinal reliability is very
+   similar and low by ICC despite high quadratic AC2.
 
 ## Remaining work on this cohort
 

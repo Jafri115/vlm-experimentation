@@ -1,0 +1,12 @@
+[
+  {"experiment":"zero-shot","model":"Qwen3-VL","kind":"classification","path":"output/vlm_wd_zero_repaired_cv/oof_predictions.csv"},
+  {"experiment":"zero-shot","model":"Qwen3-8B","kind":"classification","path":"output/llm_wd_zero_repaired_cv/oof_predictions.csv"},
+  {"experiment":"3+3 few-shot","model":"Qwen3-VL","kind":"classification","path":"output/vlm_wd_few_repaired_cv/oof_predictions.csv"},
+  {"experiment":"3+3 few-shot","model":"Qwen3-8B","kind":"classification","path":"output/llm_wd_few_repaired_cv/oof_predictions.csv"},
+  {"experiment":"regression","model":"Qwen3-VL","kind":"regression","path":"output/vlm_wd_regression_repaired_cv/oof_predictions.csv"},
+  {"experiment":"regression","model":"Qwen3-8B","kind":"regression","path":"output/llm_wd_regression_repaired_cv/oof_predictions.csv"},
+  {"experiment":"consensus fine-tuning","model":"Qwen3-VL","kind":"classification","path":"output/vlm_wd_consensus_repaired_posweight1_paired_cv/oof_predictions.csv"},
+  {"experiment":"consensus fine-tuning","model":"Qwen3-8B","kind":"classification","path":"output/llm_wd_consensus_repaired_cv/oof_predictions.csv"},
+  {"experiment":"soft-label fine-tuning","model":"Qwen3-VL","kind":"classification","path":"output/vlm_wd_soft_repaired_paired_cv/oof_predictions.csv"},
+  {"experiment":"soft-label fine-tuning","model":"Qwen3-8B","kind":"classification","path":"output/llm_wd_soft_repaired_cv/oof_predictions.csv"}
+]
