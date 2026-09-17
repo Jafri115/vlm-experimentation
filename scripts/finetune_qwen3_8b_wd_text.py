@@ -91,6 +91,7 @@ def main(args):
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
     config = vars(args).copy(); config['dataset'] = str(args.dataset.resolve()); config['output'] = str(output)
     config['system_prompt'] = SYSTEM_PROMPT
+    config['torch_seeded'] = True
     (output/'run_config.json').write_text(json.dumps(config, indent=2, default=str)+'\n', encoding='utf-8')
     counts = {split: sum(row['split'] == split for row in rows) for split in ('train', 'val', 'test')}
     patients = {split: sorted({str(row['patient_id']) for row in rows if row['split'] == split}) for split in counts}
@@ -109,6 +110,10 @@ def main(args):
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, get_linear_schedule_with_warmup
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+    # Seed initialization and dropout, not only Python/NumPy and the loader.
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA GPU required')
@@ -248,7 +253,7 @@ def main(args):
     print(json.dumps(summary,indent=2),flush=True)
 
 
-if __name__ == '__main__':
+def make_parser():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset',type=Path,required=True); p.add_argument('--mode',choices=['regression','consensus','soft'],required=True)
     p.add_argument('--output',type=Path,required=True); p.add_argument('--model',default='Qwen/Qwen3-8B'); p.add_argument('--revision',default='main')
@@ -260,4 +265,9 @@ if __name__ == '__main__':
     p.add_argument('--lora-rank',type=int,default=8); p.add_argument('--lora-alpha',type=int,default=16); p.add_argument('--lora-dropout',type=float,default=.05)
     p.add_argument('--head-dropout',type=float,default=.1); p.add_argument('--huber-beta',type=float,default=.5)
     p.add_argument('--gradient-checkpointing',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--seed',type=int,default=42)
-    p.add_argument('--prepare-only',action='store_true'); main(p.parse_args())
+    p.add_argument('--prepare-only',action='store_true')
+    return p
+
+
+if __name__ == '__main__':
+    main(make_parser().parse_args())
