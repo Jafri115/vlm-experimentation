@@ -11,7 +11,7 @@ from sklearn.pipeline import Pipeline
 from wd_presentation_common import load_folds, metrics, sha, write_json
 
 
-def fit_fold(frame, task):
+def fit_fold(frame, task, return_validation=False):
     d = frame.copy()
     if task == 'consensus':
         d = d[d.b1 == d.b2].copy()
@@ -45,11 +45,18 @@ def fit_fold(frame, task):
     records['WD_consensus']=test.b1.where(test.b1==test.b2)
     records['WD_probability' if task=='consensus' else 'WD_prediction']=pred
     records['split']='test'
-    return records, dict(task=task, train_N=len(train),val_N=len(val),test_N=len(test),
+    summary = dict(task=task, train_N=len(train),val_N=len(val),test_N=len(test),
                         selection='val_Brier' if task=='consensus' else 'val_MAE',
                         candidates=candidates, selected_strength=best.named_steps['model'].get_params()['C' if task=='consensus' else 'alpha'],
                         vocabulary_size=len(best.named_steps['tfidf'].vocabulary_),
                         test_metrics=metrics(test,pred,task))
+    if return_validation:
+        validation=val[['sample_id','segment_uid','patient_id','session_id','WD_P_rater1','WD_P_rater2']].copy()
+        validation['WD_probability' if task=='consensus' else 'WD_prediction']=(
+            best.predict_proba(val.transcript_text)[:,1] if task=='consensus' else best.predict(val.transcript_text).clip(1,5))
+        validation['split']='val'
+        return records,summary,validation
+    return records,summary
 
 
 def main(args):

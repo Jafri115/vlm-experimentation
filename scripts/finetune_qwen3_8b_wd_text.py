@@ -86,11 +86,20 @@ def regression_metrics(y, prediction):
 
 
 def main(args):
+    # Backward-compatible defaults for older saved run configurations.
+    args.context_input = getattr(args, 'context_input', False)
+    args.pooling = getattr(args, 'pooling', 'mean_all')
+    if args.pooling != 'mean_all' and not args.context_input:
+        raise ValueError('Target pooling requires a prepared context-input manifest')
+    system_prompt = SYSTEM_PROMPT
+    if args.context_input:
+        from wd_context_inputs import CONTEXT_INSTRUCTION
+        system_prompt += CONTEXT_INSTRUCTION
     rows = prepare_rows(read_jsonl(args.dataset), args.mode)
     random.seed(args.seed); np.random.seed(args.seed)
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
     config = vars(args).copy(); config['dataset'] = str(args.dataset.resolve()); config['output'] = str(output)
-    config['system_prompt'] = SYSTEM_PROMPT
+    config['system_prompt'] = system_prompt
     config['torch_seeded'] = True
     (output/'run_config.json').write_text(json.dumps(config, indent=2, default=str)+'\n', encoding='utf-8')
     counts = {split: sum(row['split'] == split for row in rows) for split in ('train', 'val', 'test')}
@@ -127,30 +136,46 @@ def main(args):
     class TextDataset(Dataset):
         def __init__(self, items):
             self.items = items
+            self.encoded = None
+            if args.context_input:
+                from wd_context_inputs import encode_row
+                self.encoded = [encode_row(tokenizer,r,system_prompt,args.max_length,args.pooling) for r in items]
         def __len__(self): return len(self.items)
         def __getitem__(self, index):
             row = self.items[index]
+            if self.encoded is not None:
+                return {**self.encoded[index], 'target': row['_target'], 'row': row}
             text = tokenizer.apply_chat_template(
-                [{'role': 'system', 'content': SYSTEM_PROMPT},
+                [{'role': 'system', 'content': system_prompt},
                  {'role': 'user', 'content': row['transcript_text']}],
                 tokenize=False, add_generation_prompt=False, enable_thinking=False)
             tokenized = tokenizer(text, add_special_tokens=False, truncation=False)
             if len(tokenized['input_ids']) > args.max_length:
                 raise ValueError(f"{row['segment_uid']} has {len(tokenized['input_ids'])} tokens; exceeds --max-length")
             return {'input_ids': tokenized['input_ids'], 'attention_mask': tokenized['attention_mask'],
+                    'pool_mask': tokenized['attention_mask'], 'pooling_fallback': False,
                     'target': row['_target'], 'row': row}
 
     def collate(batch):
         width = max(len(item['input_ids']) for item in batch)
-        ids, masks = [], []
+        ids, masks, pool_masks = [], [], []
         for item in batch:
             pad = width-len(item['input_ids'])
             ids.append(item['input_ids']+[tokenizer.pad_token_id]*pad)
             masks.append(item['attention_mask']+[0]*pad)
+            pool_masks.append(item['pool_mask']+[0]*pad)
         return {'input_ids': torch.tensor(ids), 'attention_mask': torch.tensor(masks),
+                'pool_mask': torch.tensor(pool_masks), 'pooling_fallbacks': [item['pooling_fallback'] for item in batch],
                 'targets': torch.tensor([item['target'] for item in batch], dtype=torch.float32),
                 'rows': [item['row'] for item in batch]}
 
+    # Validate/tokenize context inputs before allocating the base model.
+    datasets = {s: TextDataset([r for r in rows if r['split']==s]) for s in ('train','val','test')}
+    if args.context_input:
+        audit = [{'segment_uid': r['segment_uid'], 'split': s,
+                  'tokens': e['token_count'], 'pooling_fallback': e['pooling_fallback']}
+                 for s, dataset in datasets.items() for r,e in zip(dataset.items,dataset.encoded)]
+        (output/'token_audit.json').write_text(json.dumps(audit,indent=2)+'\n',encoding='utf-8')
     quant = None
     if not args.no_4bit:
         quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type='nf4',
@@ -173,10 +198,10 @@ def main(args):
     train_rows = [r for r in rows if r['split'] == 'train']; val_rows = [r for r in rows if r['split'] == 'val']
     test_rows = [r for r in rows if r['split'] == 'test']
     generator = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(TextDataset(train_rows), batch_size=args.batch_size, shuffle=True,
+    train_loader = DataLoader(datasets['train'], batch_size=args.batch_size, shuffle=True,
                               generator=generator, collate_fn=collate)
-    val_loader = DataLoader(TextDataset(val_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
-    test_loader = DataLoader(TextDataset(test_rows), batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+    val_loader = DataLoader(datasets['val'], batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+    test_loader = DataLoader(datasets['test'], batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
 
     parameters = [{'params': [p for p in base.parameters() if p.requires_grad], 'lr': args.learning_rate},
                   {'params': head.parameters(), 'lr': args.head_learning_rate}]
@@ -193,7 +218,8 @@ def main(args):
     def forward(batch):
         ids=batch['input_ids'].to('cuda:0'); mask=batch['attention_mask'].to('cuda:0')
         hidden=base(input_ids=ids, attention_mask=mask, return_dict=True).last_hidden_state
-        weights=mask.unsqueeze(-1).to(hidden.dtype); pooled=(hidden*weights).sum(1)/weights.sum(1).clamp_min(1)
+        weights=batch['pool_mask'].to('cuda:0').unsqueeze(-1).to(hidden.dtype)
+        pooled=(hidden*weights).sum(1)/weights.sum(1).clamp_min(1)
         return head(pooled.float()).squeeze(-1)
 
     @torch.no_grad()
@@ -201,11 +227,12 @@ def main(args):
         base.eval(); head.eval(); records=[]
         for batch in loader:
             raw=forward(batch); values=(raw.clamp(1,5) if args.mode=='regression' else torch.sigmoid(raw)).cpu().numpy()
-            for row, value in zip(batch['rows'], values):
+            for row, value, fallback in zip(batch['rows'], values, batch['pooling_fallbacks']):
                 records.append({**{k: row.get(k) for k in ('segment_uid','patient_id','session_id','segment_id','split','transcript_provider')},
                                 'WD_P_rater1': row['WD_P_rater1'], 'WD_P_rater2': row['WD_P_rater2'],
                                 'WD_P_mean': row['WD_P_mean'], 'WD_soft': row['WD_soft'],
                                 'WD_consensus': row.get('WD_consensus'),
+                                'pooling_fallback': fallback,
                                 ('WD_prediction' if args.mode=='regression' else 'WD_probability'): float(value)})
         if args.mode == 'regression':
             metric=regression_metrics([r['WD_P_mean'] for r in records], [r['WD_prediction'] for r in records])
@@ -266,6 +293,8 @@ def make_parser():
     p.add_argument('--head-dropout',type=float,default=.1); p.add_argument('--huber-beta',type=float,default=.5)
     p.add_argument('--gradient-checkpointing',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--seed',type=int,default=42)
     p.add_argument('--prepare-only',action='store_true')
+    p.add_argument('--context-input',action='store_true')
+    p.add_argument('--pooling',choices=['mean_all','target_patient'],default='mean_all')
     return p
 
 

@@ -18,6 +18,8 @@ def main(args):
         for fold in range(1,6):
             source=args.source_root/f'fold_{fold}'/'run_config.json'
             config=json.loads(source.read_text(encoding='utf-8-sig'))
+            config.setdefault('context_input',False)
+            config.setdefault('pooling','mean_all')
             if config['mode']!='soft' or config.get('system_prompt')!=training.SYSTEM_PROMPT:
                 raise ValueError(f'{source}: requires original soft run and same system prompt')
             missing=allowed-set(config)
