@@ -17,6 +17,23 @@ from report_wd_presentation import main as report_main
 
 
 class PresentationTests(unittest.TestCase):
+    def test_prediction_column_aliases(self):
+        master=pd.DataFrame({'sample_id':['a','b'],'fold':[1,2]})
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'pred.csv'
+            for alias in ['WD_prediction','WD_P_pred','prediction']:
+                pd.DataFrame({'sample_id':['a','b'],'outer_fold':[1,2],alias:[1.2,2.3]}).to_csv(path,index=False)
+                result=load_oof(path,master,'WD_prediction')
+                np.testing.assert_allclose(result.WD_prediction,[1.2,2.3])
+            pd.DataFrame({'sample_id':['a','b'],'outer_fold':[1,2],
+                          'WD_P_mean':[1.2,2.3]}).to_csv(path,index=False)
+            with self.assertRaisesRegex(ValueError,'available columns'):
+                load_oof(path,master,'WD_prediction')
+            pd.DataFrame({'sample_id':['a','b'],'outer_fold':[1,2],
+                          'WD_P_pred':[1.2,2.3],'prediction':[2.,2.]}).to_csv(path,index=False)
+            with self.assertRaisesRegex(ValueError,'conflicting prediction'):
+                load_oof(path,master,'WD_prediction')
+
     def test_derangements_and_singletons(self):
         d=pd.DataFrame({'patient_id':[1,1,1,2,2,3],'fold':[1,1,1,2,2,3]})
         idx=donors(d,np.random.default_rng(42))
@@ -60,6 +77,10 @@ class PresentationTests(unittest.TestCase):
             self.assertTrue((gains.ci_low>0).all())
             specs=[{'experiment':task,'model':model,'path':str(root/'pred.csv')}
                 for task in ['consensus fine-tuning','regression'] for model in ['LLM','VLM']]
+            # Exercise the historical VLM export format through the full report.
+            pred.rename(columns={'WD_prediction':'WD_P_pred'}).to_csv(root/'vlm.csv',index=False)
+            for spec in specs:
+                if spec['model']=='VLM':spec['path']=str(root/'vlm.csv')
             (root/'specs.json').write_text(json.dumps(specs))
             report_main(argparse.Namespace(master_root=master_root,specs=root/'specs.json',root=out,
                 output=out/'report',bootstrap=20,no_plots=False))

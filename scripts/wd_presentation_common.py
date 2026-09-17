@@ -46,7 +46,24 @@ def load_oof(path, master, column):
         raise ValueError(f'{path}: IDs outside frozen cohort')
     if 'outer_fold' not in p:
         raise ValueError(f'{path}: outer_fold required to verify the held-out checkpoint')
-    values = pd.to_numeric(p[column], errors='coerce')
+    # Older VLM regressors export WD_P_pred, while the text model and
+    # TF-IDF baseline export WD_prediction. Normalize only prediction fields.
+    aliases = {'WD_prediction': ['WD_P_pred', 'prediction'],
+               'WD_probability': ['probability']}
+    source = column
+    if source not in p:
+        candidates = [name for name in aliases.get(column, []) if name in p]
+        if not candidates:
+            raise ValueError(f'{path}: missing prediction column {column!r}; '
+                             f'accepted alternatives: {aliases.get(column, [])}; '
+                             f'available columns: {list(p.columns)}')
+        source = candidates[0]
+        for other in candidates[1:]:
+            if not pd.to_numeric(p[source], errors='coerce').equals(
+                    pd.to_numeric(p[other], errors='coerce')):
+                raise ValueError(f'{path}: conflicting prediction columns {candidates}')
+        print(f'{path}: using {source} as {column}', flush=True)
+    values = pd.to_numeric(p[source], errors='coerce')
     if not np.isfinite(values).all():
         raise ValueError(f'{path}: invalid predictions')
     if column == 'WD_probability' and not values.between(0, 1).all():
