@@ -21,6 +21,7 @@ def main(args):
             config.setdefault('context_input',False)
             config.setdefault('pooling','mean_all')
             config.setdefault('patient_balanced',False)
+            config.setdefault('rubric','legacy_short_v1')
             if config['mode']!='soft' or config.get('system_prompt')!=training.SYSTEM_PROMPT:
                 raise ValueError(f'{source}: requires original soft run and same system prompt')
             missing=allowed-set(config)

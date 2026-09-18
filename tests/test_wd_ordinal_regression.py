@@ -8,11 +8,18 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from finetune_qwen3_8b_wd_text import prepare_rows
+from finetune_qwen3_8b_wd_text import MANUAL_V2_SYSTEM_PROMPT, SYSTEM_PROMPTS, prepare_rows
 from report_wd_ordinal_regression import report
 
 
 class OrdinalTargetTests(unittest.TestCase):
+    def test_manual_rubric_has_ordinal_anchors_without_binary_rule(self):
+        self.assertIs(SYSTEM_PROMPTS["manual_compact_v2"], MANUAL_V2_SYSTEM_PROMPT)
+        for phrase in ("Shutting down", "Avoiding", "Masking experience",
+                       "at least one clear marker", "1 =", "3 =", "5 ="):
+            self.assertIn(phrase, MANUAL_V2_SYSTEM_PROMPT)
+        self.assertNotIn("positive", MANUAL_V2_SYSTEM_PROMPT.lower())
+
     def test_two_ratings_become_a_distribution(self):
         rows = []
         for patient, split in enumerate(("train", "val", "test"), 1):

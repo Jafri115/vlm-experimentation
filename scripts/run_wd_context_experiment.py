@@ -30,6 +30,7 @@ def main(args):
             p=args.source_root/f'fold_{fold}'/'run_config.json'
             c=json.loads(p.read_text(encoding='utf-8-sig'))
             c.setdefault('context_input',False);c.setdefault('pooling','mean_all')
+            c.setdefault('patient_balanced',False);c.setdefault('rubric','legacy_short_v1')
             if c['mode']!='consensus' or c.get('system_prompt')!=training.SYSTEM_PROMPT:
                 raise ValueError(f'{p}: expected original consensus model settings')
             if allowed-set(c):raise ValueError(f'{p}: missing settings {allowed-set(c)}')

@@ -92,6 +92,7 @@ foreach ($model in $models) {
             'scripts/finetune_qwen3_8b_wd_text.py',
             '--dataset', (Join-Path $MasterRoot "fold_$fold\master_manifest.jsonl"),
             '--mode', 'ordinal', '--patient-balanced',
+            '--rubric', 'manual_compact_v2',
             '--model', $model.Id, '--output', $out,
             '--epochs', '3', '--learning-rate', $model.LearningRate,
             '--head-learning-rate', '1e-4', '--batch-size', '1',

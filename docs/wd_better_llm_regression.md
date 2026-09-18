@@ -16,6 +16,9 @@ patient folds.
   patient with many segments cannot dominate the fit.
 - **Representation:** the last non-padding token, which has attended to the
   complete transcript and instruction.
+- **Rubric:** `manual_compact_v2`, a fixed English task specification derived
+  from the original 3RS manual. It includes WD_P forms, counterexamples, and
+  the official 1/3/5 salience logic without binary-threshold prompting.
 - **Primary endpoint:** out-of-fold MAE against the mean of the two human WD_P
   ratings. Checkpoints are selected by validation MAE only.
 - **Secondary endpoints:** RMSE, Spearman correlation, within-patient centered
