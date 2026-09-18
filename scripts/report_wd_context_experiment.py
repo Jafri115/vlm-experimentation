@@ -6,6 +6,21 @@ import pandas as pd
 from wd_presentation_common import load_folds,load_oof,metrics,paired_interval
 
 
+def markdown_table(frame, float_digits=4):
+    """Render Markdown without pandas' optional tabulate dependency."""
+    def display(value):
+        if pd.isna(value):
+            return ''
+        if isinstance(value,(float,np.floating)):
+            return f'{float(value):.{float_digits}f}'
+        return str(value).replace('|','\\|').replace('\n',' ')
+    columns=[str(column) for column in frame.columns]
+    lines=['| '+' | '.join(columns)+' |','| '+' | '.join(['---']*len(columns))+' |']
+    lines.extend('| '+' | '.join(display(value) for value in row)+' |'
+                 for row in frame.itertuples(index=False,name=None))
+    return '\n'.join(lines)
+
+
 def report(master_root,root):
     master,_=load_folds(master_root)
     expected=set(master.loc[master.b1==master.b2,'sample_id'])
@@ -33,9 +48,9 @@ def report(master_root,root):
     comparison=pd.DataFrame(comparisons);comparison.to_csv(root/'comparisons.csv',index=False)
     cols=['model','variant','N','balanced_accuracy','AUROC','Brier','F1','recall','specificity']
     text='# Transcript context experiment\n\nFixed 0.5 threshold; identical consensus targets and frozen patient folds.\n\n'
-    text+=table[cols].to_markdown(index=False,floatfmt='.4f') if len(table) else 'No complete predictions yet.'
+    text+=markdown_table(table[cols]) if len(table) else 'No complete predictions yet.'
     text+='\n\nPositive Brier improvement favors the named model. Intervals resample patients, not segments.\n\n'
-    if len(comparison):text+=comparison.to_markdown(index=False,floatfmt='.4f')
+    if len(comparison):text+=markdown_table(comparison)
     text+='\n\nThese are exploratory comparisons on an already inspected cohort. Context benefit is not guaranteed. '
     text+='The optional patient pooling contrast changes pooling as well as the input representation; it is reported separately.\n'
     (root/'report.md').write_text(text,encoding='utf-8')

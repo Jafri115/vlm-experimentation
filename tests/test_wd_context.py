@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from wd_context_inputs import build_context,encode_row,TARGET_HEADER
+from report_wd_context_experiment import markdown_table
 
 
 class CharacterTokenizer:
@@ -18,6 +19,11 @@ class CharacterTokenizer:
 
 
 class ContextTests(unittest.TestCase):
+    def test_markdown_has_no_optional_dependency(self):
+        rendered=markdown_table(pd.DataFrame({'model':['LLM|text'],'score':[.62123]}))
+        self.assertIn('LLM\\|text',rendered)
+        self.assertIn('0.6212',rendered)
+
     def frame(self):
         return pd.DataFrame({'segment_uid':['a','b','c','d'],'patient_id':[1]*4,
             'session_id':[1,1,1,2],'split':['train']*4,'start_sec':[0,60,180,0],

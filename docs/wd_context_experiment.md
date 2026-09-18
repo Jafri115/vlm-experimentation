@@ -64,8 +64,8 @@ No waiting scheduler is used. A file lock rejects a second queue using the same
 output directory. Ensure other GPU jobs have finished. Failures stop the queue;
 rerunning resumes completed folds only when input/config/code fingerprints match.
 Changes require a new `--output` folder. The existing virtual environment needs the
-same PyTorch, Transformers, PEFT, bitsandbytes, pandas, scikit-learn, matplotlib and
-tabulate dependencies as the previous experiments; this code does not upgrade them.
+same PyTorch, Transformers, PEFT, bitsandbytes, pandas, scikit-learn and matplotlib
+dependencies as the previous experiments; this code does not upgrade them.
 
 ```powershell
 Get-Content output/wd_context_experiment/queue.log -Tail 30 -Wait
