@@ -2,6 +2,8 @@
 
 Modes:
   regression: predict mean 1-5 WD_P using SmoothL1 loss.
+  ordinal: predict a five-level human-rating distribution and use its expected
+    value as the continuous 1-5 WD_P prediction.
   consensus: train/evaluate unanimous binary WD_P rows only.
   soft: train on 0/0.5/1 rater targets; select/evaluate on consensus rows.
 
@@ -42,14 +44,25 @@ def prepare_rows(rows, mode):
                 for split in ('train', 'val', 'test')}
     if patients['train'] & patients['val'] or patients['train'] & patients['test'] or patients['val'] & patients['test']:
         raise ValueError('Patient leakage detected across train/val/test')
-    target = {'regression': 'WD_P_mean', 'consensus': 'WD_consensus', 'soft': 'WD_soft'}[mode]
+    target = {'regression': 'WD_P_mean', 'ordinal': 'WD_P_mean',
+              'consensus': 'WD_consensus', 'soft': 'WD_soft'}[mode]
     prepared = []
     for row in rows:
         if mode == 'consensus' and not finite(row.get('WD_consensus')):
             continue
         if not finite(row.get(target)):
             continue
-        prepared.append({**row, '_target': float(row[target]), 'split': str(row['split']).lower()})
+        item = {**row, '_target': float(row[target]), 'split': str(row['split']).lower()}
+        if mode == 'ordinal':
+            ratings = [row.get('WD_P_rater1'), row.get('WD_P_rater2')]
+            if not all(finite(value) and float(value).is_integer() and 1 <= int(float(value)) <= 5
+                       for value in ratings):
+                continue
+            distribution = [0.0] * 5
+            for value in ratings:
+                distribution[int(float(value)) - 1] += 0.5
+            item['_target_distribution'] = distribution
+        prepared.append(item)
     for split in ('train', 'val', 'test'):
         if not any(row['split'] == split for row in prepared):
             raise ValueError(f'No usable {split} rows for mode={mode}')
@@ -89,13 +102,30 @@ def main(args):
     # Backward-compatible defaults for older saved run configurations.
     args.context_input = getattr(args, 'context_input', False)
     args.pooling = getattr(args, 'pooling', 'mean_all')
-    if args.pooling != 'mean_all' and not args.context_input:
+    args.patient_balanced = getattr(args, 'patient_balanced', False)
+    if args.pooling == 'target_patient' and not args.context_input:
         raise ValueError('Target pooling requires a prepared context-input manifest')
     system_prompt = SYSTEM_PROMPT
     if args.context_input:
         from wd_context_inputs import CONTEXT_INSTRUCTION
         system_prompt += CONTEXT_INSTRUCTION
     rows = prepare_rows(read_jsonl(args.dataset), args.mode)
+    train_patient_counts = {}
+    for row in rows:
+        if row['split'] == 'train':
+            key = str(row['patient_id'])
+            train_patient_counts[key] = train_patient_counts.get(key, 0) + 1
+    if args.patient_balanced:
+        if not train_patient_counts:
+            raise ValueError('Patient-balanced training requires training rows')
+        train_n = sum(train_patient_counts.values())
+        patient_n = len(train_patient_counts)
+        for row in rows:
+            row['_sample_weight'] = (train_n / (patient_n * train_patient_counts[str(row['patient_id'])])
+                                     if row['split'] == 'train' else 1.0)
+    else:
+        for row in rows:
+            row['_sample_weight'] = 1.0
     random.seed(args.seed); np.random.seed(args.seed)
     output = args.output.resolve(); output.mkdir(parents=True, exist_ok=True)
     config = vars(args).copy(); config['dataset'] = str(args.dataset.resolve()); config['output'] = str(output)
@@ -105,6 +135,8 @@ def main(args):
     counts = {split: sum(row['split'] == split for row in rows) for split in ('train', 'val', 'test')}
     patients = {split: sorted({str(row['patient_id']) for row in rows if row['split'] == split}) for split in counts}
     preparation = {'mode': args.mode, 'row_counts': counts, 'patients': patients,
+                   'patient_balanced': args.patient_balanced,
+                   'train_patient_segment_counts': train_patient_counts,
                    'patient_disjoint': not (set(patients['train']) & set(patients['val']) or
                                             set(patients['train']) & set(patients['test']) or
                                             set(patients['val']) & set(patients['test']))}
@@ -144,7 +176,9 @@ def main(args):
         def __getitem__(self, index):
             row = self.items[index]
             if self.encoded is not None:
-                return {**self.encoded[index], 'target': row['_target'], 'row': row}
+                return {**self.encoded[index], 'target': row['_target'],
+                        'target_distribution': row.get('_target_distribution'),
+                        'sample_weight': row['_sample_weight'], 'row': row}
             text = tokenizer.apply_chat_template(
                 [{'role': 'system', 'content': system_prompt},
                  {'role': 'user', 'content': row['transcript_text']}],
@@ -154,7 +188,8 @@ def main(args):
                 raise ValueError(f"{row['segment_uid']} has {len(tokenized['input_ids'])} tokens; exceeds --max-length")
             return {'input_ids': tokenized['input_ids'], 'attention_mask': tokenized['attention_mask'],
                     'pool_mask': tokenized['attention_mask'], 'pooling_fallback': False,
-                    'target': row['_target'], 'row': row}
+                    'target': row['_target'], 'target_distribution': row.get('_target_distribution'),
+                    'sample_weight': row['_sample_weight'], 'row': row}
 
     def collate(batch):
         width = max(len(item['input_ids']) for item in batch)
@@ -164,10 +199,15 @@ def main(args):
             ids.append(item['input_ids']+[tokenizer.pad_token_id]*pad)
             masks.append(item['attention_mask']+[0]*pad)
             pool_masks.append(item['pool_mask']+[0]*pad)
-        return {'input_ids': torch.tensor(ids), 'attention_mask': torch.tensor(masks),
+        result = {'input_ids': torch.tensor(ids), 'attention_mask': torch.tensor(masks),
                 'pool_mask': torch.tensor(pool_masks), 'pooling_fallbacks': [item['pooling_fallback'] for item in batch],
                 'targets': torch.tensor([item['target'] for item in batch], dtype=torch.float32),
+                'sample_weights': torch.tensor([item['sample_weight'] for item in batch], dtype=torch.float32),
                 'rows': [item['row'] for item in batch]}
+        if args.mode == 'ordinal':
+            result['target_distributions'] = torch.tensor(
+                [item['target_distribution'] for item in batch], dtype=torch.float32)
+        return result
 
     # Validate/tokenize context inputs before allocating the base model.
     datasets = {s: TextDataset([r for r in rows if r['split']==s]) for s in ('train','val','test')}
@@ -192,7 +232,8 @@ def main(args):
                       target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'])
     base = get_peft_model(base, lora)
     hidden_size = int(base.config.hidden_size)
-    head = nn.Sequential(nn.Dropout(args.head_dropout), nn.Linear(hidden_size, 1)).to('cuda:0', dtype=torch.float32)
+    output_size = 5 if args.mode == 'ordinal' else 1
+    head = nn.Sequential(nn.Dropout(args.head_dropout), nn.Linear(hidden_size, output_size)).to('cuda:0', dtype=torch.float32)
     base.print_trainable_parameters()
 
     train_rows = [r for r in rows if r['split'] == 'train']; val_rows = [r for r in rows if r['split'] == 'val']
@@ -218,23 +259,40 @@ def main(args):
     def forward(batch):
         ids=batch['input_ids'].to('cuda:0'); mask=batch['attention_mask'].to('cuda:0')
         hidden=base(input_ids=ids, attention_mask=mask, return_dict=True).last_hidden_state
-        weights=batch['pool_mask'].to('cuda:0').unsqueeze(-1).to(hidden.dtype)
-        pooled=(hidden*weights).sum(1)/weights.sum(1).clamp_min(1)
-        return head(pooled.float()).squeeze(-1)
+        if args.pooling == 'last_token':
+            last_index = mask.sum(dim=1).clamp_min(1) - 1
+            pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last_index]
+        else:
+            weights=batch['pool_mask'].to('cuda:0').unsqueeze(-1).to(hidden.dtype)
+            pooled=(hidden*weights).sum(1)/weights.sum(1).clamp_min(1)
+        raw = head(pooled.float())
+        return raw if args.mode == 'ordinal' else raw.squeeze(-1)
 
     @torch.no_grad()
     def evaluate(loader):
         base.eval(); head.eval(); records=[]
         for batch in loader:
-            raw=forward(batch); values=(raw.clamp(1,5) if args.mode=='regression' else torch.sigmoid(raw)).cpu().numpy()
-            for row, value, fallback in zip(batch['rows'], values, batch['pooling_fallbacks']):
-                records.append({**{k: row.get(k) for k in ('segment_uid','patient_id','session_id','segment_id','split','transcript_provider')},
+            raw=forward(batch)
+            if args.mode == 'ordinal':
+                probabilities = torch.softmax(raw, dim=-1)
+                support = torch.arange(1, 6, device=raw.device, dtype=probabilities.dtype)
+                values = (probabilities * support).sum(-1).cpu().numpy()
+                probabilities = probabilities.cpu().numpy()
+            else:
+                values=(raw.clamp(1,5) if args.mode=='regression' else torch.sigmoid(raw)).cpu().numpy()
+                probabilities = [None] * len(values)
+            for row, value, probability, fallback in zip(batch['rows'], values, probabilities, batch['pooling_fallbacks']):
+                record = {**{k: row.get(k) for k in ('sample_id','segment_uid','patient_id','session_id','segment_id','split','transcript_provider')},
                                 'WD_P_rater1': row['WD_P_rater1'], 'WD_P_rater2': row['WD_P_rater2'],
                                 'WD_P_mean': row['WD_P_mean'], 'WD_soft': row['WD_soft'],
                                 'WD_consensus': row.get('WD_consensus'),
                                 'pooling_fallback': fallback,
-                                ('WD_prediction' if args.mode=='regression' else 'WD_probability'): float(value)})
-        if args.mode == 'regression':
+                                ('WD_prediction' if args.mode in {'regression','ordinal'} else 'WD_probability'): float(value)}
+                if probability is not None:
+                    record.update({f'WD_score_probability_{score}': float(probability[score-1])
+                                   for score in range(1, 6)})
+                records.append(record)
+        if args.mode in {'regression', 'ordinal'}:
             metric=regression_metrics([r['WD_P_mean'] for r in records], [r['WD_prediction'] for r in records])
         else:
             consensus=[r for r in records if finite(r.get('WD_consensus'))]
@@ -248,13 +306,22 @@ def main(args):
         base.train(); head.train(); running=0.0
         for step,batch in enumerate(train_loader,1):
             targets=batch['targets'].to('cuda:0'); raw=forward(batch)
-            loss=(huber(raw,targets) if args.mode=='regression' else bce(raw,targets))/args.grad_accum
+            if args.mode == 'ordinal':
+                target_distributions = batch['target_distributions'].to('cuda:0')
+                sample_weights = batch['sample_weights'].to('cuda:0')
+                per_item = -(target_distributions * torch.log_softmax(raw, dim=-1)).sum(-1)
+                objective = (per_item * sample_weights).mean()
+            elif args.mode == 'regression':
+                objective = huber(raw,targets)
+            else:
+                objective = bce(raw,targets)
+            loss=objective/args.grad_accum
             loss.backward(); running+=float(loss.detach().cpu())*args.grad_accum
             if step%args.grad_accum==0 or step==len(train_loader):
                 torch.nn.utils.clip_grad_norm_([p for p in base.parameters() if p.requires_grad]+list(head.parameters()),args.max_grad_norm)
                 optimizer.step(); scheduler.step(); optimizer.zero_grad(set_to_none=True)
         val_metric,_=evaluate(val_loader)
-        selection=(-val_metric['mae'] if args.mode=='regression' else (val_metric['auprc'] or -1))
+        selection=(-val_metric['mae'] if args.mode in {'regression','ordinal'} else (val_metric['auprc'] or -1))
         history.append({'epoch':epoch,'train_loss':running/len(train_loader),**{f'val_{k}':v for k,v in val_metric.items()}})
         print(json.dumps(history[-1]),flush=True)
         if selection>best_score:
@@ -273,8 +340,10 @@ def main(args):
     pd.DataFrame(test_predictions).to_csv(output/'test_predictions.csv',index=False,encoding='utf-8-sig')
     base.save_pretrained(output/'best_adapter'); tokenizer.save_pretrained(output/'best_adapter')
     torch.save(head.state_dict(),output/'best_head.pt')
-    summary={'mode':args.mode,'selection_metric':'val_mae' if args.mode=='regression' else 'val_consensus_auprc',
-             'fixed_probability_threshold':None if args.mode=='regression' else 0.5,
+    summary={'mode':args.mode,
+             'objective':'soft_ordinal_cross_entropy' if args.mode=='ordinal' else ('huber' if args.mode=='regression' else 'binary_cross_entropy'),
+             'selection_metric':'val_mae' if args.mode in {'regression','ordinal'} else 'val_consensus_auprc',
+             'fixed_probability_threshold':None if args.mode in {'regression','ordinal'} else 0.5,
              'val_metrics':val_metric,'test_metrics':test_metric,'row_counts':counts,'patient_disjoint':True}
     (output/'final_summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(summary,indent=2),flush=True)
@@ -282,7 +351,7 @@ def main(args):
 
 def make_parser():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--dataset',type=Path,required=True); p.add_argument('--mode',choices=['regression','consensus','soft'],required=True)
+    p.add_argument('--dataset',type=Path,required=True); p.add_argument('--mode',choices=['regression','ordinal','consensus','soft'],required=True)
     p.add_argument('--output',type=Path,required=True); p.add_argument('--model',default='Qwen/Qwen3-8B'); p.add_argument('--revision',default='main')
     p.add_argument('--dtype',choices=['bfloat16','float16'],default='bfloat16'); p.add_argument('--no-4bit',action='store_true')
     p.add_argument('--attention',choices=['sdpa','eager','flash_attention_2'],default='sdpa'); p.add_argument('--max-length',type=int,default=2048)
@@ -294,7 +363,9 @@ def make_parser():
     p.add_argument('--gradient-checkpointing',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--seed',type=int,default=42)
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--context-input',action='store_true')
-    p.add_argument('--pooling',choices=['mean_all','target_patient'],default='mean_all')
+    p.add_argument('--pooling',choices=['mean_all','last_token','target_patient'],default='mean_all')
+    p.add_argument('--patient-balanced',action=argparse.BooleanOptionalAction,default=False,
+                   help='Give every training patient equal total loss weight.')
     return p
 
 

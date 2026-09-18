@@ -3,6 +3,7 @@ param(
     [string]$MasterRoot = ".\output\wd_multimodal_master_repaired",
     [string]$FrameCache = ".\output\qwen3vl_wd_planning196_thr2\frame_cache_16",
     [string]$QueueRoot = ".\output\wd_pending_repaired_queue",
+    [string]$CohortTag = "repaired",
     [int]$WaitForProcessId = 0,
     [int]$GpuIdleMinutes = 10
 )
@@ -11,6 +12,7 @@ $ErrorActionPreference = "Stop"
 $Project = (Get-Location).Path
 function Abs([string]$p) { if ([IO.Path]::IsPathRooted($p)) { return $p }; return Join-Path $Project $p }
 $Python = Abs $Python; $MasterRoot = Abs $MasterRoot; $FrameCache = Abs $FrameCache; $QueueRoot = Abs $QueueRoot
+if ($CohortTag -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid CohortTag: $CohortTag" }
 $Logs = Join-Path $QueueRoot "logs"; New-Item -ItemType Directory -Path $Logs -Force | Out-Null
 $QueueLog = Join-Path $QueueRoot "queue.log"
 
@@ -38,8 +40,8 @@ function Run-Step([string]$name,[string[]]$arguments,[string]$complete) {
     & $Python @arguments *>> $log
     $code=$LASTEXITCODE
     $ErrorActionPreference = $savedPreference
-    if ($code -ne 0) { Note "FAILED $name (exit $code)"; return }
-    if (-not (Test-Path -LiteralPath $complete)) { Note "FAILED $name (completion file absent)"; return }
+    if ($code -ne 0) { Note "FAILED $name (exit $code)"; throw "Queue stopped after $name; inspect $log" }
+    if (-not (Test-Path -LiteralPath $complete)) { Note "FAILED $name (completion file absent)"; throw "Queue stopped after $name; completion file absent" }
     Note "COMPLETED $name"
 }
 
@@ -59,42 +61,42 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Python not fo
 if (-not (Test-Path -LiteralPath $FrameCache -PathType Container)) { throw "Frame cache not found: $FrameCache" }
 1..5 | ForEach-Object { if (-not (Test-Path (Join-Path $MasterRoot "fold_$_\master_manifest.csv"))) { throw "Missing fold $_ master manifest" } }
 & $Python -c "import torch,transformers,peft,bitsandbytes,PIL,pandas,numpy,scipy,sklearn"; if ($LASTEXITCODE -ne 0) { throw "Python environment preflight failed" }
-Note "Pending repaired-cohort queue started"
+Note "Pending $CohortTag cohort queue started"
 
 # Direct VLM zero-shot.
 1..5 | ForEach-Object {
-    $fold=$_; $out=Join-Path $Project "output\vlm_wd_zero_repaired_cv\fold_$fold"
+    $fold=$_; $out=Join-Path $Project "output\vlm_wd_zero_${CohortTag}_cv\fold_$fold"
     Run-Step "vlm_zero_fold_$fold" @("scripts/run_qwen3vl_wd_zero_fewshot_aligned.py","--manifest",(Join-Path $MasterRoot "fold_$fold\master_manifest.csv"),"--frame-cache",$FrameCache,"--shot","zero","--output",$out) (Join-Path $out "summary.json")
 }
 
 # Transcript 3+3 few-shot on the repaired folds.
 1..5 | ForEach-Object {
-    $fold=$_; $out=Join-Path $Project "output\llm_wd_few_repaired_cv\fold_$fold"
+    $fold=$_; $out=Join-Path $Project "output\llm_wd_few_${CohortTag}_cv\fold_$fold"
     Run-Step "llm_few_fold_$fold" @("scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py","--dataset",(Join-Path $MasterRoot "fold_$fold\master_manifest.jsonl"),"--shot","few","--examples-per-class","3","--output",$out) (Join-Path $out "summary.json")
 }
 
 # Direct visual 3+3 few-shot. Four frames per demonstration and 16 target frames
 # keep the multimodal context practical on a 32 GB GPU.
 1..5 | ForEach-Object {
-    $fold=$_; $out=Join-Path $Project "output\vlm_wd_few_repaired_cv\fold_$fold"
+    $fold=$_; $out=Join-Path $Project "output\vlm_wd_few_${CohortTag}_cv\fold_$fold"
     Run-Step "vlm_few_fold_$fold" @("scripts/run_qwen3vl_wd_zero_fewshot_aligned.py","--manifest",(Join-Path $MasterRoot "fold_$fold\master_manifest.csv"),"--frame-cache",$FrameCache,"--shot","few","--examples-per-class","3","--demo-frames","4","--target-frames","16","--output",$out) (Join-Path $out "summary.json")
 }
 
 # Continuous VLM regression using the same frozen fold assignments.
 1..5 | ForEach-Object {
-    $fold=$_; $out=Join-Path $Project "output\vlm_wd_regression_repaired_cv\fold_$fold"
+    $fold=$_; $out=Join-Path $Project "output\vlm_wd_regression_${CohortTag}_cv\fold_$fold"
     Run-Step "vlm_regression_fold_$fold" @("scripts/finetune_qwen3vl_wd_only_large.py","--input-manifest",(Join-Path $MasterRoot "fold_$fold\master_manifest.csv"),"--frame-cache",$FrameCache,"--positive-threshold","2","--epochs","1","--num-frames","16","--frame-width","224","--output-dir",$out) (Join-Path $out "final_summary.json")
 }
 
 # Combine successful prompt and regression fold predictions.
 foreach ($spec in @(
-    @{Name="combine_vlm_zero"; Root="output\vlm_wd_zero_repaired_cv"; File="predictions.csv"},
-    @{Name="combine_llm_few"; Root="output\llm_wd_few_repaired_cv"; File="predictions.csv"},
-    @{Name="combine_vlm_few"; Root="output\vlm_wd_few_repaired_cv"; File="predictions.csv"},
-    @{Name="combine_vlm_regression"; Root="output\vlm_wd_regression_repaired_cv"; File="test_predictions.csv"}
+    @{Name="combine_vlm_zero"; Root="output\vlm_wd_zero_${CohortTag}_cv"; File="predictions.csv"},
+    @{Name="combine_llm_few"; Root="output\llm_wd_few_${CohortTag}_cv"; File="predictions.csv"},
+    @{Name="combine_vlm_few"; Root="output\vlm_wd_few_${CohortTag}_cv"; File="predictions.csv"},
+    @{Name="combine_vlm_regression"; Root="output\vlm_wd_regression_${CohortTag}_cv"; File="test_predictions.csv"}
 )) {
     $root=Join-Path $Project $spec.Root; $combined=Join-Path $root "oof_predictions.csv"
     Run-Step $spec.Name @("scripts/combine_wd_cv_predictions.py","--fold-root",$root,"--filename",$spec.File,"--output",$combined) $combined
 }
 
-Note "Pending repaired-cohort queue finished"
+Note "Pending $CohortTag cohort queue finished"

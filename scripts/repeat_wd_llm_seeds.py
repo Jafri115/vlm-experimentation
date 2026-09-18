@@ -20,6 +20,7 @@ def main(args):
             config=json.loads(source.read_text(encoding='utf-8-sig'))
             config.setdefault('context_input',False)
             config.setdefault('pooling','mean_all')
+            config.setdefault('patient_balanced',False)
             if config['mode']!='soft' or config.get('system_prompt')!=training.SYSTEM_PROMPT:
                 raise ValueError(f'{source}: requires original soft run and same system prompt')
             missing=allowed-set(config)

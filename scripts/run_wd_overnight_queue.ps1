@@ -3,6 +3,7 @@ param(
     [string]$VlmPython = ".\.venv\Scripts\python.exe",
     [string]$VlmFrameCache = ".\output\qwen3vl_wd_planning196_thr2\frame_cache_16",
     [string]$MasterRoot = ".\output\wd_multimodal_master_repaired",
+    [string]$CohortTag = "repaired",
     [switch]$IncludeVlm,
     [switch]$IncludeFewShot,
     [int[]]$Folds = @(1, 2, 3, 4, 5)
@@ -24,6 +25,7 @@ $LlmPython = Resolve-ProjectPath $LlmPython
 $VlmPython = Resolve-ProjectPath $VlmPython
 $VlmFrameCache = Resolve-ProjectPath $VlmFrameCache
 $MasterRoot = Resolve-ProjectPath $MasterRoot
+if ($CohortTag -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid CohortTag: $CohortTag" }
 if (-not (Test-Path -LiteralPath $LlmPython)) {
     $FallbackPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
     if (Test-Path -LiteralPath $FallbackPython) {
@@ -37,7 +39,7 @@ if ($IncludeVlm -and -not (Test-Path -LiteralPath $VlmPython)) {
     throw "VLM Python executable not found: $VlmPython"
 }
 
-$RunRoot = Join-Path $ProjectRoot "output\wd_overnight_queue"
+$RunRoot = Join-Path $ProjectRoot "output\wd_overnight_queue_$CohortTag"
 $LogRoot = Join-Path $RunRoot "logs"
 New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
 $StatusPath = Join-Path $RunRoot "job_status.csv"
@@ -109,6 +111,9 @@ function Invoke-QueuedJob {
     })
     Save-Status
     Write-QueueMessage "$Status $Name (exit $ExitCode)"
+    if ($Status -ne "COMPLETED") {
+        throw "Queue stopped after $Name ($Status). Inspect $LogPath"
+    }
 }
 
 function Test-AllFoldFiles([string]$Root, [string]$Filename) {
@@ -147,6 +152,7 @@ Write-QueueMessage "Project: $ProjectRoot"
 Write-QueueMessage "LLM Python: $LlmPython"
 Write-QueueMessage "Include VLM: $IncludeVlm"
 Write-QueueMessage "Master cohort: $MasterRoot"
+Write-QueueMessage "Cohort tag: $CohortTag"
 
 # Fail once with a clear message when the transferred experiment bundle is
 # incomplete, instead of producing the same traceback for every fold.
@@ -215,9 +221,9 @@ foreach ($Fold in $Folds) {
             "scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py",
             "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
             "--shot", "zero",
-            "--output", "output/llm_wd_zero_repaired_cv/fold_$Fold"
+            "--output", "output/llm_wd_zero_${CohortTag}_cv/fold_$Fold"
         ) `
-        -CompletionFile "output/llm_wd_zero_repaired_cv/fold_$Fold/summary.json"
+        -CompletionFile "output/llm_wd_zero_${CohortTag}_cv/fold_$Fold/summary.json"
 }
 
 if ($IncludeFewShot) {
@@ -229,9 +235,9 @@ foreach ($Fold in $Folds) {
             "scripts/run_qwen3_8b_wd_zero_fewshot_aligned.py",
             "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
             "--shot", "few", "--examples-per-class", "3",
-            "--output", "output/llm_wd_few_repaired_cv/fold_$Fold"
+            "--output", "output/llm_wd_few_${CohortTag}_cv/fold_$Fold"
         ) `
-        -CompletionFile "output/llm_wd_few_repaired_cv/fold_$Fold/summary.json"
+        -CompletionFile "output/llm_wd_few_${CohortTag}_cv/fold_$Fold/summary.json"
 }
 }
 
@@ -245,9 +251,9 @@ foreach ($Mode in @("regression", "consensus", "soft")) {
                 "scripts/finetune_qwen3_8b_wd_text.py",
                 "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
                 "--mode", $Mode,
-                "--output", "output/llm_wd_${Mode}_repaired_cv/fold_$Fold"
+                "--output", "output/llm_wd_${Mode}_${CohortTag}_cv/fold_$Fold"
             ) `
-            -CompletionFile "output/llm_wd_${Mode}_repaired_cv/fold_$Fold/final_summary.json"
+            -CompletionFile "output/llm_wd_${Mode}_${CohortTag}_cv/fold_$Fold/final_summary.json"
     }
 }
 
@@ -265,16 +271,16 @@ if ($IncludeVlm) {
                     "--target-mode", $Mode,
                     "--positive-threshold", "2",
                     "--frame-cache", $VlmFrameCache,
-                    "--output-dir", "output/vlm_wd_${Mode}_repaired_paired_cv/fold_$Fold"
+                    "--output-dir", "output/vlm_wd_${Mode}_${CohortTag}_paired_cv/fold_$Fold"
                 ) `
-                -CompletionFile "output/vlm_wd_${Mode}_repaired_paired_cv/fold_$Fold/final_summary.json"
+                -CompletionFile "output/vlm_wd_${Mode}_${CohortTag}_paired_cv/fold_$Fold/final_summary.json"
         }
     }
 }
 
 # Out-of-fold aggregation. Prompting scripts call their file predictions.csv;
 # fine-tuning scripts call it test_predictions.csv.
-foreach ($PromptRoot in @("llm_wd_zero_repaired_cv", "llm_wd_few_repaired_cv")) {
+foreach ($PromptRoot in @("llm_wd_zero_${CohortTag}_cv", "llm_wd_few_${CohortTag}_cv")) {
     if (Test-AllFoldFiles "output/$PromptRoot" "predictions.csv") {
         Invoke-QueuedJob `
             -Name "combine_$PromptRoot" `
@@ -290,8 +296,8 @@ foreach ($PromptRoot in @("llm_wd_zero_repaired_cv", "llm_wd_few_repaired_cv")) 
 }
 
 foreach ($ModelRoot in @(
-    "llm_wd_regression_repaired_cv", "llm_wd_consensus_repaired_cv", "llm_wd_soft_repaired_cv",
-    "vlm_wd_consensus_repaired_paired_cv", "vlm_wd_soft_repaired_paired_cv"
+    "llm_wd_regression_${CohortTag}_cv", "llm_wd_consensus_${CohortTag}_cv", "llm_wd_soft_${CohortTag}_cv",
+    "vlm_wd_consensus_${CohortTag}_paired_cv", "vlm_wd_soft_${CohortTag}_paired_cv"
 )) {
     if (Test-AllFoldFiles "output/$ModelRoot" "test_predictions.csv") {
         Invoke-QueuedJob `
@@ -315,15 +321,15 @@ Invoke-QueuedJob `
     -Arguments @(
         "scripts/plot_wd_training_validation.py",
         "--root", "output",
-        "--output", "output/wd_training_plots_repaired",
-        "--suffix", "_repaired"
+        "--output", "output/wd_training_plots_$CohortTag",
+        "--suffix", "_$CohortTag"
     ) `
-    -CompletionFile "output/wd_training_plots_repaired/llm_consensus_train_validation.png"
+    -CompletionFile "output/wd_training_plots_$CohortTag/llm_consensus_train_validation.png"
 
 if ($IncludeVlm) {
     foreach ($Mode in @("consensus", "soft")) {
-        $VlmPredictions = "output/vlm_wd_${Mode}_repaired_paired_cv/oof_predictions.csv"
-        $LlmPredictions = "output/llm_wd_${Mode}_repaired_cv/oof_predictions.csv"
+        $VlmPredictions = "output/vlm_wd_${Mode}_${CohortTag}_paired_cv/oof_predictions.csv"
+        $LlmPredictions = "output/llm_wd_${Mode}_${CohortTag}_cv/oof_predictions.csv"
         if ((Test-Path -LiteralPath (Resolve-ProjectPath $VlmPredictions)) -and
             (Test-Path -LiteralPath (Resolve-ProjectPath $LlmPredictions))) {
             Invoke-QueuedJob `
@@ -334,9 +340,9 @@ if ($IncludeVlm) {
                     "--vlm-predictions", $VlmPredictions,
                     "--llm-predictions", $LlmPredictions,
                     "--vlm-threshold-column", "fold_selected_threshold",
-                    "--output", "output/paired_comparison_${Mode}_repaired"
+                    "--output", "output/paired_comparison_${Mode}_$CohortTag"
                 ) `
-                -CompletionFile "output/paired_comparison_${Mode}_repaired/comparison_summary.json"
+                -CompletionFile "output/paired_comparison_${Mode}_$CohortTag/comparison_summary.json"
         }
     }
 }
