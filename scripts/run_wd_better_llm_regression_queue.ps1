@@ -6,9 +6,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
 Set-Location -LiteralPath $Repo
-$Python = [IO.Path]::GetFullPath((Join-Path $Repo $Python))
-$MasterRoot = [IO.Path]::GetFullPath((Join-Path $Repo $MasterRoot))
-$QueueRoot = [IO.Path]::GetFullPath((Join-Path $Repo $QueueRoot))
+function Resolve-QueuePath([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { throw 'A required path is empty' }
+    if ([IO.Path]::IsPathRooted($Value)) {
+        return [IO.Path]::GetFullPath($Value)
+    }
+    return [IO.Path]::GetFullPath((Join-Path $Repo $Value))
+}
+$Python = Resolve-QueuePath $Python
+$MasterRoot = Resolve-QueuePath $MasterRoot
+$QueueRoot = Resolve-QueuePath $QueueRoot
 $LogRoot = Join-Path $QueueRoot 'logs'
 New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
 $QueueLog = Join-Path $QueueRoot 'queue.log'

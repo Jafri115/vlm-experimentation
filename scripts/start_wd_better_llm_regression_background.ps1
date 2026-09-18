@@ -6,7 +6,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
 Set-Location -LiteralPath $Repo
-$QueueRoot = [IO.Path]::GetFullPath((Join-Path $Repo $QueueRoot))
+if ([IO.Path]::IsPathRooted($QueueRoot)) {
+    $QueueRoot = [IO.Path]::GetFullPath($QueueRoot)
+} else {
+    $QueueRoot = [IO.Path]::GetFullPath((Join-Path $Repo $QueueRoot))
+}
 New-Item -ItemType Directory -Path $QueueRoot -Force | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
 $outLog = Join-Path $QueueRoot "background_$stamp.out.log"
