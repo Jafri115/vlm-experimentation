@@ -43,3 +43,24 @@ The finalized files are:
 The final row count may be lower than 4,325 when a video is missing, patient side
 is unresolved, or crop extraction fails. Those exclusions are deliberate: the LLM
 must not retain a segment that the VLM cannot evaluate.
+
+## Resolve a small number of missing patient sides
+
+When `excluded_patient_side.csv` contains patients, generate a compact local HTML
+review. It shows one representative video and three frames per patient:
+
+```powershell
+python scripts\wd_patient_side_review.py build
+Start-Process output\wd_patient_side_review\index.html
+```
+
+Choose LEFT or RIGHT on every card and download `wd_patient_side_decisions.json`.
+Apply it safely; the script first backs up the role cache:
+
+```powershell
+python scripts\wd_patient_side_review.py apply `
+  --decisions "$env:USERPROFILE\Downloads\wd_patient_side_decisions.json"
+```
+
+Then rerun the cohort builder. Existing frames are reused and only newly eligible
+segments are processed. The HTML is entirely local and uploads nothing.
