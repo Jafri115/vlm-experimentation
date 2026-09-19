@@ -512,7 +512,8 @@ def main(args):
         return result
 
     # Validate/tokenize context inputs before allocating the base model.
-    datasets = {s: TextDataset([r for r in rows if r['split']==s]) for s in ('train','val','test')}
+    evaluated_splits = ('train', 'val') if args.skip_test_evaluation else ('train', 'val', 'test')
+    datasets = {s: TextDataset([r for r in rows if r['split']==s]) for s in evaluated_splits}
     if args.context_input:
         audit = [{'segment_uid': r['segment_uid'], 'split': s,
                   'tokens': e['token_count'], 'pooling_fallback': e['pooling_fallback']}
@@ -544,7 +545,9 @@ def main(args):
     train_loader = DataLoader(datasets['train'], batch_size=args.batch_size, shuffle=True,
                               generator=generator, collate_fn=collate)
     val_loader = DataLoader(datasets['val'], batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
-    test_loader = DataLoader(datasets['test'], batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate)
+    test_loader = (None if args.skip_test_evaluation else
+                   DataLoader(datasets['test'], batch_size=args.eval_batch_size,
+                              shuffle=False, collate_fn=collate))
 
     parameters = [{'params': [p for p in base.parameters() if p.requires_grad], 'lr': args.learning_rate},
                   {'params': head.parameters(), 'lr': args.head_learning_rate}]
@@ -668,11 +671,16 @@ def main(args):
         for n,p in base.named_parameters():
             if n in best_state['base']: p.copy_(best_state['base'][n].to(p.device,p.dtype))
         for n,p in head.named_parameters(): p.copy_(best_state['head'][n].to(p.device,p.dtype))
-    val_metric,val_predictions=evaluate(val_loader); test_metric,test_predictions=evaluate(test_loader)
+    val_metric,val_predictions=evaluate(val_loader)
+    if args.skip_test_evaluation:
+        test_metric, test_predictions = None, None
+    else:
+        test_metric,test_predictions=evaluate(test_loader)
     import pandas as pd
     pd.DataFrame(history).to_csv(output/'training_history.csv',index=False)
     pd.DataFrame(val_predictions).to_csv(output/'val_predictions.csv',index=False,encoding='utf-8-sig')
-    pd.DataFrame(test_predictions).to_csv(output/'test_predictions.csv',index=False,encoding='utf-8-sig')
+    if test_predictions is not None:
+        pd.DataFrame(test_predictions).to_csv(output/'test_predictions.csv',index=False,encoding='utf-8-sig')
     base.save_pretrained(output/'best_adapter'); tokenizer.save_pretrained(output/'best_adapter')
     torch.save(head.state_dict(),output/'best_head.pt')
     objectives = {'ordinal': 'soft_ordinal_cross_entropy', 'cumulative': 'monotonic_cumulative_soft_bce',
@@ -688,7 +696,9 @@ def main(args):
              'cumulative_positive_weights':([args.cumulative_ge2_pos_weight,
                                              args.cumulative_ge3_pos_weight]
                                             if args.mode=='cumulative' else None),
-             'val_metrics':val_metric,'test_metrics':test_metric,'row_counts':counts,'patient_disjoint':True}
+             'val_metrics':val_metric,'test_metrics':test_metric,
+             'test_evaluation_skipped':args.skip_test_evaluation,
+             'row_counts':counts,'patient_disjoint':True}
     (output/'final_summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(summary,indent=2),flush=True)
 
@@ -708,6 +718,8 @@ def make_parser():
     p.add_argument('--cumulative-ge3-pos-weight',type=float,default=2.5)
     p.add_argument('--gradient-checkpointing',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--seed',type=int,default=42)
     p.add_argument('--prepare-only',action='store_true')
+    p.add_argument('--skip-test-evaluation',action='store_true',
+                   help='Development mode: select/report on validation only and never run held-out test inference.')
     p.add_argument('--context-input',action='store_true')
     p.add_argument('--pooling',choices=['mean_all','last_token','target_patient'],default='mean_all')
     p.add_argument('--patient-balanced',action=argparse.BooleanOptionalAction,default=False,

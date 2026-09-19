@@ -248,6 +248,10 @@ test_v8_1_qwen30_load.ps1
 !scripts/run_wd_expanded_full_queue.ps1
 !scripts/start_wd_expanded_full_queue_background.ps1
 !scripts/run_wd_better_llm_regression_queue.ps1
+!scripts/run_wd_fast_dev.ps1
+!scripts/start_wd_fast_dev_background.ps1
+!scripts/run_wd_fast_dev_after_expanded_queue.ps1
+!scripts/start_wd_fast_dev_after_expanded_background.ps1
 !scripts/start_wd_better_llm_regression_background.ps1
 !data/wd_ai_reliability_specs.json
 models/face_detection_yunet/face_detection_yunet_2026may.onnx
