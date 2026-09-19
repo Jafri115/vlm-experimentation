@@ -265,6 +265,10 @@ SYSTEM_PROMPTS = {
     'manual_detailed_v3': MANUAL_V3_SYSTEM_PROMPT,
 }
 
+# Compatibility names used by earlier queue/script revisions. Keep these aliases
+# so an older SYSTEM_PROMPTS declaration cannot fail during a resumed run.
+SYSTEM_PROMPT = LEGACY_SHORT_V1_SYSTEM_PROMPT
+
 
 def read_jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding='utf-8-sig').splitlines() if line.strip()]

@@ -251,6 +251,9 @@ foreach ($Mode in @("regression", "consensus", "soft")) {
                 "scripts/finetune_qwen3_8b_wd_text.py",
                 "--dataset", (Join-Path $MasterRoot "fold_$Fold\master_manifest.jsonl"),
                 "--mode", $Mode,
+                # Freeze the original prompt used by this experiment suite.
+                # New prompt experiments must use separate output folders.
+                "--rubric", "legacy_short_v1",
                 "--output", "output/llm_wd_${Mode}_${CohortTag}_cv/fold_$Fold"
             ) `
             -CompletionFile "output/llm_wd_${Mode}_${CohortTag}_cv/fold_$Fold/final_summary.json"
