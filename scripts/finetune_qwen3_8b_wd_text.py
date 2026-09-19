@@ -4,6 +4,7 @@ Modes:
   regression: predict mean 1-5 WD_P using SmoothL1 loss.
   ordinal: predict a five-level human-rating distribution and use its expected
     value as the continuous 1-5 WD_P prediction.
+  cumulative: predict monotonic P(WD>=2) and P(WD>=3), preserving both raters.
   consensus: train/evaluate unanimous binary WD_P rows only.
   soft: train on 0/0.5/1 rater targets; select/evaluate on consensus rows.
 
@@ -266,7 +267,7 @@ SYSTEM_PROMPTS = {
 
 
 def read_jsonl(path):
-    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    return [json.loads(line) for line in path.read_text(encoding='utf-8-sig').splitlines() if line.strip()]
 
 
 def finite(value):
@@ -283,7 +284,7 @@ def prepare_rows(rows, mode):
                 for split in ('train', 'val', 'test')}
     if patients['train'] & patients['val'] or patients['train'] & patients['test'] or patients['val'] & patients['test']:
         raise ValueError('Patient leakage detected across train/val/test')
-    target = {'regression': 'WD_P_mean', 'ordinal': 'WD_P_mean',
+    target = {'regression': 'WD_P_mean', 'ordinal': 'WD_P_mean', 'cumulative': 'WD_P_mean',
               'consensus': 'WD_consensus', 'soft': 'WD_soft'}[mode]
     prepared = []
     for row in rows:
@@ -292,15 +293,22 @@ def prepare_rows(rows, mode):
         if not finite(row.get(target)):
             continue
         item = {**row, '_target': float(row[target]), 'split': str(row['split']).lower()}
-        if mode == 'ordinal':
+        if mode in {'ordinal', 'cumulative'}:
             ratings = [row.get('WD_P_rater1'), row.get('WD_P_rater2')]
             if not all(finite(value) and float(value).is_integer() and 1 <= int(float(value)) <= 5
                        for value in ratings):
                 continue
-            distribution = [0.0] * 5
-            for value in ratings:
-                distribution[int(float(value)) - 1] += 0.5
-            item['_target_distribution'] = distribution
+            if mode == 'ordinal':
+                distribution = [0.0] * 5
+                for value in ratings:
+                    distribution[int(float(value)) - 1] += 0.5
+                item['_target_distribution'] = distribution
+            else:
+                numeric = [int(float(value)) for value in ratings]
+                item['_cumulative_targets'] = [
+                    sum(value >= threshold for value in numeric) / 2.0
+                    for threshold in (2, 3)
+                ]
         prepared.append(item)
     for split in ('train', 'val', 'test'):
         if not any(row['split'] == split for row in prepared):
@@ -311,6 +319,13 @@ def prepare_rows(rows, mode):
 def binary_metrics(y, probability, threshold=0.5):
     from sklearn.metrics import average_precision_score, roc_auc_score
     y = np.asarray(y, dtype=int); p = np.asarray(probability, dtype=float); pred = (p >= threshold).astype(int)
+    if not len(y):
+        return {'N': 0, 'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0,
+                'accuracy': None, 'balanced_accuracy': None, 'precision': None,
+                'recall': None, 'specificity': None, 'f1': None, 'auprc': None,
+                'auroc': None, 'prevalence': None, 'predicted_positive_rate': None,
+                'probability_min': None, 'probability_max': None,
+                'probability_mean': None, 'threshold': threshold}
     tp = int(((y == 1) & (pred == 1)).sum()); tn = int(((y == 0) & (pred == 0)).sum())
     fp = int(((y == 0) & (pred == 1)).sum()); fn = int(((y == 1) & (pred == 0)).sum())
     div = lambda a, b: float(a/b) if b else 0.0
@@ -329,12 +344,50 @@ def binary_metrics(y, probability, threshold=0.5):
 def regression_metrics(y, prediction):
     from scipy.stats import spearmanr
     y = np.asarray(y, dtype=float); p = np.asarray(prediction, dtype=float)
-    rho = spearmanr(y, p).statistic if len(y) > 1 else float('nan')
+    rho = (spearmanr(y, p).statistic
+           if len(y) > 1 and np.ptp(y) > 0 and np.ptp(p) > 0 else float('nan'))
     return {'N': len(y), 'mae': float(np.abs(y-p).mean()), 'rmse': float(np.sqrt(((y-p)**2).mean())),
             'spearman': float(rho) if np.isfinite(rho) else None,
             'true_min': float(y.min()), 'true_max': float(y.max()),
             'prediction_min': float(p.min()), 'prediction_max': float(p.max()),
             'prediction_mean': float(p.mean())}
+
+
+def cumulative_metrics(rater1, rater2, probability_ge_2, probability_ge_3, threshold=0.5):
+    """Evaluate the two monotonic thresholds without pretending 4/5 are learnable."""
+    from sklearn.metrics import f1_score
+    r1 = np.asarray(rater1, dtype=float); r2 = np.asarray(rater2, dtype=float)
+    p2 = np.asarray(probability_ge_2, dtype=float); p3 = np.asarray(probability_ge_3, dtype=float)
+    if not (len(r1) == len(r2) == len(p2) == len(p3)) or not len(r1):
+        raise ValueError('Cumulative metric arrays must have the same non-zero length')
+    result = {'N': int(len(r1)),
+              'monotonic_violations': int((p3 > p2 + 1e-7).sum()),
+              'probability_ge_2_mean': float(p2.mean()),
+              'probability_ge_3_mean': float(p3.mean())}
+    threshold_balanced = []
+    for cutoff, probability in ((2, p2), (3, p3)):
+        a = (r1 >= cutoff).astype(int); b = (r2 >= cutoff).astype(int)
+        keep = a == b
+        metrics = binary_metrics(a[keep], probability[keep], threshold)
+        result.update({f'ge_{cutoff}_consensus_{key}': value for key, value in metrics.items()})
+        if metrics['balanced_accuracy'] is not None:
+            threshold_balanced.append(metrics['balanced_accuracy'])
+    human_mean_capped = np.minimum((r1 + r2) / 2.0, 3.0)
+    expected = 1.0 + p2 + p3
+    severity = regression_metrics(human_mean_capped, expected)
+    result.update({f'capped_severity_{key}': value for key, value in severity.items()})
+    true_class = 1 + (human_mean_capped >= 2).astype(int) + (human_mean_capped >= 3).astype(int)
+    pred_class = 1 + (p2 >= threshold).astype(int) + (p3 >= threshold).astype(int)
+    class_recalls = [float((pred_class[true_class == label] == label).mean())
+                     for label in np.unique(true_class)]
+    result.update({
+        'three_level_accuracy': float((true_class == pred_class).mean()),
+        'three_level_balanced_accuracy': float(np.mean(class_recalls)),
+        'three_level_macro_f1': float(f1_score(true_class, pred_class, average='macro', zero_division=0)),
+        'threshold_mean_balanced_accuracy': (float(np.mean(threshold_balanced))
+                                             if threshold_balanced else None),
+    })
+    return result
 
 
 def main(args):
@@ -418,6 +471,7 @@ def main(args):
             if self.encoded is not None:
                 return {**self.encoded[index], 'target': row['_target'],
                         'target_distribution': row.get('_target_distribution'),
+                        'cumulative_targets': row.get('_cumulative_targets'),
                         'sample_weight': row['_sample_weight'], 'row': row}
             text = tokenizer.apply_chat_template(
                 [{'role': 'system', 'content': system_prompt},
@@ -429,6 +483,7 @@ def main(args):
             return {'input_ids': tokenized['input_ids'], 'attention_mask': tokenized['attention_mask'],
                     'pool_mask': tokenized['attention_mask'], 'pooling_fallback': False,
                     'target': row['_target'], 'target_distribution': row.get('_target_distribution'),
+                    'cumulative_targets': row.get('_cumulative_targets'),
                     'sample_weight': row['_sample_weight'], 'row': row}
 
     def collate(batch):
@@ -447,6 +502,9 @@ def main(args):
         if args.mode == 'ordinal':
             result['target_distributions'] = torch.tensor(
                 [item['target_distribution'] for item in batch], dtype=torch.float32)
+        elif args.mode == 'cumulative':
+            result['cumulative_targets'] = torch.tensor(
+                [item['cumulative_targets'] for item in batch], dtype=torch.float32)
         return result
 
     # Validate/tokenize context inputs before allocating the base model.
@@ -472,7 +530,7 @@ def main(args):
                       target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'])
     base = get_peft_model(base, lora)
     hidden_size = int(base.config.hidden_size)
-    output_size = 5 if args.mode == 'ordinal' else 1
+    output_size = 5 if args.mode == 'ordinal' else (2 if args.mode == 'cumulative' else 1)
     head = nn.Sequential(nn.Dropout(args.head_dropout), nn.Linear(hidden_size, output_size)).to('cuda:0', dtype=torch.float32)
     base.print_trainable_parameters()
 
@@ -495,6 +553,16 @@ def main(args):
     else:
         pos_weight = None
     bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight); huber = nn.SmoothL1Loss(beta=args.huber_beta)
+    cumulative_pos_weight = torch.tensor(
+        [args.cumulative_ge2_pos_weight, args.cumulative_ge3_pos_weight],
+        device='cuda:0', dtype=torch.float32)
+    cumulative_bce = nn.BCEWithLogitsLoss(pos_weight=cumulative_pos_weight, reduction='none')
+
+    def monotonic_cumulative_logits(raw):
+        """Guarantee logit(WD>=3) <= logit(WD>=2), hence p3 <= p2."""
+        logit_ge_2 = raw[:, 0]
+        logit_ge_3 = logit_ge_2 - torch.nn.functional.softplus(raw[:, 1])
+        return torch.stack((logit_ge_2, logit_ge_3), dim=-1)
 
     def forward(batch):
         ids=batch['input_ids'].to('cuda:0'); mask=batch['attention_mask'].to('cuda:0')
@@ -506,7 +574,7 @@ def main(args):
             weights=batch['pool_mask'].to('cuda:0').unsqueeze(-1).to(hidden.dtype)
             pooled=(hidden*weights).sum(1)/weights.sum(1).clamp_min(1)
         raw = head(pooled.float())
-        return raw if args.mode == 'ordinal' else raw.squeeze(-1)
+        return raw if args.mode in {'ordinal', 'cumulative'} else raw.squeeze(-1)
 
     @torch.no_grad()
     def evaluate(loader):
@@ -518,6 +586,9 @@ def main(args):
                 support = torch.arange(1, 6, device=raw.device, dtype=probabilities.dtype)
                 values = (probabilities * support).sum(-1).cpu().numpy()
                 probabilities = probabilities.cpu().numpy()
+            elif args.mode == 'cumulative':
+                probabilities = torch.sigmoid(monotonic_cumulative_logits(raw)).cpu().numpy()
+                values = 1.0 + probabilities[:, 0] + probabilities[:, 1]
             else:
                 values=(raw.clamp(1,5) if args.mode=='regression' else torch.sigmoid(raw)).cpu().numpy()
                 probabilities = [None] * len(values)
@@ -527,13 +598,23 @@ def main(args):
                                 'WD_P_mean': row['WD_P_mean'], 'WD_soft': row['WD_soft'],
                                 'WD_consensus': row.get('WD_consensus'),
                                 'pooling_fallback': fallback,
-                                ('WD_prediction' if args.mode in {'regression','ordinal'} else 'WD_probability'): float(value)}
-                if probability is not None:
+                                ('WD_prediction' if args.mode in {'regression','ordinal','cumulative'} else 'WD_probability'): float(value)}
+                if args.mode == 'cumulative':
+                    record.update({'WD_probability_ge_2': float(probability[0]),
+                                   'WD_probability_ge_3': float(probability[1]),
+                                   'WD_three_level_prediction': int(1 + (probability[0] >= 0.5) +
+                                                                            (probability[1] >= 0.5))})
+                elif probability is not None:
                     record.update({f'WD_score_probability_{score}': float(probability[score-1])
                                    for score in range(1, 6)})
                 records.append(record)
         if args.mode in {'regression', 'ordinal'}:
             metric=regression_metrics([r['WD_P_mean'] for r in records], [r['WD_prediction'] for r in records])
+        elif args.mode == 'cumulative':
+            metric=cumulative_metrics([r['WD_P_rater1'] for r in records],
+                                      [r['WD_P_rater2'] for r in records],
+                                      [r['WD_probability_ge_2'] for r in records],
+                                      [r['WD_probability_ge_3'] for r in records])
         else:
             consensus=[r for r in records if finite(r.get('WD_consensus'))]
             metric=binary_metrics([int(float(r['WD_consensus'])) for r in consensus],
@@ -551,6 +632,11 @@ def main(args):
                 sample_weights = batch['sample_weights'].to('cuda:0')
                 per_item = -(target_distributions * torch.log_softmax(raw, dim=-1)).sum(-1)
                 objective = (per_item * sample_weights).mean()
+            elif args.mode == 'cumulative':
+                cumulative_targets = batch['cumulative_targets'].to('cuda:0')
+                sample_weights = batch['sample_weights'].to('cuda:0')
+                per_threshold = cumulative_bce(monotonic_cumulative_logits(raw), cumulative_targets)
+                objective = (per_threshold.mean(-1) * sample_weights).mean()
             elif args.mode == 'regression':
                 objective = huber(raw,targets)
             else:
@@ -561,7 +647,12 @@ def main(args):
                 torch.nn.utils.clip_grad_norm_([p for p in base.parameters() if p.requires_grad]+list(head.parameters()),args.max_grad_norm)
                 optimizer.step(); scheduler.step(); optimizer.zero_grad(set_to_none=True)
         val_metric,_=evaluate(val_loader)
-        selection=(-val_metric['mae'] if args.mode in {'regression','ordinal'} else (val_metric['auprc'] or -1))
+        if args.mode in {'regression', 'ordinal'}:
+            selection = -val_metric['mae']
+        elif args.mode == 'cumulative':
+            selection = val_metric['threshold_mean_balanced_accuracy']
+        else:
+            selection = val_metric['auprc'] or -1
         history.append({'epoch':epoch,'train_loss':running/len(train_loader),**{f'val_{k}':v for k,v in val_metric.items()}})
         print(json.dumps(history[-1]),flush=True)
         if selection>best_score:
@@ -580,10 +671,19 @@ def main(args):
     pd.DataFrame(test_predictions).to_csv(output/'test_predictions.csv',index=False,encoding='utf-8-sig')
     base.save_pretrained(output/'best_adapter'); tokenizer.save_pretrained(output/'best_adapter')
     torch.save(head.state_dict(),output/'best_head.pt')
+    objectives = {'ordinal': 'soft_ordinal_cross_entropy', 'cumulative': 'monotonic_cumulative_soft_bce',
+                  'regression': 'huber', 'consensus': 'binary_cross_entropy', 'soft': 'binary_cross_entropy'}
+    selections = {'ordinal': 'val_mae', 'regression': 'val_mae',
+                  'cumulative': 'val_threshold_mean_balanced_accuracy',
+                  'consensus': 'val_consensus_auprc', 'soft': 'val_consensus_auprc'}
     summary={'mode':args.mode,
-             'objective':'soft_ordinal_cross_entropy' if args.mode=='ordinal' else ('huber' if args.mode=='regression' else 'binary_cross_entropy'),
-             'selection_metric':'val_mae' if args.mode in {'regression','ordinal'} else 'val_consensus_auprc',
-             'fixed_probability_threshold':None if args.mode in {'regression','ordinal'} else 0.5,
+             'objective':objectives[args.mode],
+             'selection_metric':selections[args.mode],
+             'fixed_probability_threshold':0.5 if args.mode in {'consensus','soft','cumulative'} else None,
+             'cumulative_thresholds':[2,3] if args.mode=='cumulative' else None,
+             'cumulative_positive_weights':([args.cumulative_ge2_pos_weight,
+                                             args.cumulative_ge3_pos_weight]
+                                            if args.mode=='cumulative' else None),
              'val_metrics':val_metric,'test_metrics':test_metric,'row_counts':counts,'patient_disjoint':True}
     (output/'final_summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(summary,indent=2),flush=True)
@@ -591,7 +691,7 @@ def main(args):
 
 def make_parser():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--dataset',type=Path,required=True); p.add_argument('--mode',choices=['regression','ordinal','consensus','soft'],required=True)
+    p.add_argument('--dataset',type=Path,required=True); p.add_argument('--mode',choices=['regression','ordinal','cumulative','consensus','soft'],required=True)
     p.add_argument('--output',type=Path,required=True); p.add_argument('--model',default='Qwen/Qwen3-8B'); p.add_argument('--revision',default='main')
     p.add_argument('--dtype',choices=['bfloat16','float16'],default='bfloat16'); p.add_argument('--no-4bit',action='store_true')
     p.add_argument('--attention',choices=['sdpa','eager','flash_attention_2'],default='sdpa'); p.add_argument('--max-length',type=int,default=2048)
@@ -600,6 +700,8 @@ def make_parser():
     p.add_argument('--weight-decay',type=float,default=.01); p.add_argument('--warmup-ratio',type=float,default=.05); p.add_argument('--max-grad-norm',type=float,default=1.0)
     p.add_argument('--lora-rank',type=int,default=8); p.add_argument('--lora-alpha',type=int,default=16); p.add_argument('--lora-dropout',type=float,default=.05)
     p.add_argument('--head-dropout',type=float,default=.1); p.add_argument('--huber-beta',type=float,default=.5)
+    p.add_argument('--cumulative-ge2-pos-weight',type=float,default=1.0)
+    p.add_argument('--cumulative-ge3-pos-weight',type=float,default=2.5)
     p.add_argument('--gradient-checkpointing',action=argparse.BooleanOptionalAction,default=True); p.add_argument('--seed',type=int,default=42)
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--context-input',action='store_true')

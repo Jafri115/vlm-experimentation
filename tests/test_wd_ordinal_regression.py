@@ -12,6 +12,7 @@ from finetune_qwen3_8b_wd_text import (
     MANUAL_V2_SYSTEM_PROMPT,
     MANUAL_V3_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
+    cumulative_metrics,
     prepare_rows,
 )
 from report_wd_ordinal_regression import report
@@ -52,6 +53,27 @@ class OrdinalTargetTests(unittest.TestCase):
                  "WD_P_rater1": 4, "WD_P_rater2": 4}
                 for index, split in enumerate(("train", "val", "test"), 1)]
         self.assertEqual(prepare_rows(rows, "ordinal")[0]["_target_distribution"], [0, 0, 0, 1, 0])
+
+    def test_cumulative_targets_preserve_rater_disagreement(self):
+        pairs = ((1, 1), (1, 3), (2, 4), (3, 3))
+        rows = []
+        for index, (split, pair) in enumerate(zip(("train", "val", "test"), pairs[:3]), 1):
+            rows.append({"split": split, "patient_id": index, "WD_P_mean": sum(pair) / 2,
+                         "WD_P_rater1": pair[0], "WD_P_rater2": pair[1]})
+        prepared = prepare_rows(rows, "cumulative")
+        self.assertEqual(prepared[0]["_cumulative_targets"], [0.0, 0.0])
+        self.assertEqual(prepared[1]["_cumulative_targets"], [0.5, 0.5])
+        self.assertEqual(prepared[2]["_cumulative_targets"], [1.0, 0.5])
+
+    def test_cumulative_metrics_use_consensus_per_threshold(self):
+        metrics = cumulative_metrics(
+            [1, 2, 3, 4], [1, 3, 3, 4],
+            [0.1, 0.8, 0.9, 0.95], [0.05, 0.4, 0.8, 0.9],
+        )
+        self.assertEqual(metrics["monotonic_violations"], 0)
+        self.assertEqual(metrics["ge_2_consensus_N"], 4)
+        self.assertEqual(metrics["ge_3_consensus_N"], 3)
+        self.assertAlmostEqual(metrics["three_level_accuracy"], 1.0)
 
     def test_report_validates_and_writes_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

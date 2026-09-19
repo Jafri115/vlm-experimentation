@@ -236,6 +236,8 @@ test_v8_1_qwen30_load.ps1
 *.zip
 *.csv
 *.ps1
+!scripts/run_wd_cumulative_ordinal_expanded_queue.ps1
+!scripts/start_wd_cumulative_ordinal_background.ps1
 !scripts/run_wd_pending_repaired_queue.ps1
 !scripts/collect_wd_overnight_results.ps1
 !scripts/run_wd_overnight_queue.ps1
