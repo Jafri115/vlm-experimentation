@@ -157,8 +157,16 @@ def save_continuous_boxplot(frame: pd.DataFrame, summary: pd.DataFrame, output: 
     distributions = [frame.loc[frame["human_pair"] == pair, "model_prediction_clipped"].to_numpy()
                      for pair in pairs]
     fig, axis = plt.subplots(figsize=(15, 7))
-    plot = axis.boxplot(distributions, labels=pairs, patch_artist=True, showfliers=False,
-                        medianprops={"color": "#172B4D", "linewidth": 1.5})
+    boxplot_options = {
+        "patch_artist": True,
+        "showfliers": False,
+        "medianprops": {"color": "#172B4D", "linewidth": 1.5},
+    }
+    try:
+        # Matplotlib >=3.9 renamed labels to tick_labels.
+        plot = axis.boxplot(distributions, tick_labels=pairs, **boxplot_options)
+    except TypeError:
+        plot = axis.boxplot(distributions, labels=pairs, **boxplot_options)
     for patch in plot["boxes"]:
         patch.set(facecolor="#66CCEE", alpha=.7)
     human_means = [sum(int(value) for value in pair.split("/")) / 2 for pair in pairs]
