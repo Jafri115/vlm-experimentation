@@ -43,15 +43,30 @@ from peft import get_peft_model_state_dict, set_peft_model_state_dict
 import finetune_qwen3vl_rupture_pilot as base
 
 
-WINDOW_PROMPT = """The images are chronological frames sampled from one 15-second window of a psychotherapy session.
+WINDOW_PROMPT = """The images are chronological frames sampled from one 15-second window
+within a labelled 1-minute psychotherapy segment.
+
 Focus only on the visible patient/person being observed.
 
-Create an internal visual representation useful for estimating patient rupture-marker salience over the full minute:
-- WD_P: patient withdrawal salience
-- CF_P: patient confrontation salience
+Create an internal visual representation useful for estimating patient rupture-marker
+salience over the FULL MINUTE:
+- WD_P: patient withdrawal
+- CF_P: patient confrontation
 
-Use only visible patient behavior. Do not use audio or transcript.
-Do not assign a rupture score to this 15-second window by itself.
+Attend to directly visible behavioral patterns and how they develop across the window,
+including persistence, repetition, changes, and interaction-relevant visual behavior.
+
+The final 3RS labels apply to the full 1-minute segment, not to this 15-second window.
+Therefore:
+- do not assign an independent 1-5 rupture rating to this window,
+- do not assume that one isolated visual cue determines the minute-level label,
+- preserve information that could help distinguish weak/ambiguous, clear, elevated,
+  and dominant behavior when combined with the other windows.
+
+Use only directly visible patient behavior.
+Do not infer speech content, motivation, diagnosis, personality, hidden emotion, or
+therapeutic meaning that cannot be established visually.
+Do not use audio or transcript.
 """
 
 

@@ -124,37 +124,35 @@ def build_binary_prompt(positive_threshold: float) -> str:
         boundary_text = """
 3RS DECISION BOUNDARY: RATING >= 2
 ---------------------------------
-The positive class includes Patient Moves Away ratings of 2 or higher.
+The positive class includes human Patient Moves Away ratings of 2 or higher.
 
 A rating of 2 lies between:
 - 1 = movements away are not salient, and
 - 3 = movements away are somewhat salient.
 
-Therefore, for this >=2 experiment, a positive example does NOT require
-a fully clear withdrawal marker. It can include subtle but meaningful
-visible evidence that is stronger than a rating of 1.
+Therefore, for this >=2 experiment, a positive human label does NOT require
+a fully clear withdrawal marker. Preserve subtle visual patterns that may help
+the supervised model distinguish this class, without treating them as proof.
 
-The negative class corresponds to rating 1:
-- no withdrawal marker is visible, OR
-- only one possible marker is present and it is very low in intensity
-  and clarity and does not stand out.
+The negative class corresponds to a human rating of 1: no salient withdrawal,
+or only one possible marker of very low intensity and clarity.
 
-When evidence is subtle, preserve it in the representation rather than
-discarding it merely because it would not yet warrant a rating of 3.
+When a visual pattern is subtle, preserve it in the representation rather than
+discarding it merely because it would not by itself warrant a rating of 3.
 """.strip()
 
     elif threshold == 3.0:
         boundary_text = """
 3RS DECISION BOUNDARY: RATING >= 3
 ---------------------------------
-The positive class corresponds to somewhat salient or greater
-Patient Moves Away.
+The positive class corresponds to a human rating of clear/somewhat-salient or
+greater Patient Moves Away.
 
-There should be at least one CLEAR withdrawal marker.
+The human rating requires at least one clear withdrawal marker, although the
+marker may depend on dialogue that is unavailable to this visual-only model.
 
-The negative class corresponds to ratings below 3:
-- no clear withdrawal marker, OR
-- only weak, brief, ambiguous, or isolated possible evidence.
+The negative class corresponds to human ratings below 3: no clear marker, or
+only weak, brief, ambiguous, or isolated possible evidence.
 """.strip()
 
     else:
@@ -163,100 +161,32 @@ The negative class corresponds to ratings below 3:
         )
 
     return f"""
-You are observing ONLY the PATIENT in chronological frames sampled
-across one labelled minute of a psychotherapy session.
+The images are chronological frames sampled across one labelled minute
+of a psychotherapy session.
 
-There is NO audio and NO transcript.
+Focus only on the visible patient/person being observed.
 
-The target is based on the 3RS v2022 construct
-"Patient moves away" (withdrawal).
+Create an internal visual representation useful for distinguishing the
+human-rated 3RS Patient Moves Away (WD_P) classes described below.
 
-3RS CONCEPT
------------
-Withdrawal means movement away from the therapist and/or from the
-work of therapy.
+Represent directly visible behavior across the WHOLE MINUTE, including whether
+behavioral patterns are isolated or repeated, weak or prominent, brief or
+persistent, and whether a recurring pattern visually dominates the minute.
 
-For this visual-only task, assess ONLY directly visible evidence.
-Do not infer speech content, internal states, intentions, emotions,
-motivation, resistance, or alliance quality.
-
-VISUAL EVIDENCE TO INSPECT
---------------------------
-Pay close attention to persistent states and changes involving:
-
-GAZE / EYES
-- sustained gaze away from the therapist
-- sustained downward gaze
-- prolonged gaze disengagement
-- eyes closed for a sustained period
-- changes from visually engaged gaze to disengaged gaze
-
-HEAD / FACE
-- head angled or turned away for a sustained period
-- sustained head-down posture
-- visible reduction in facial responsiveness
-- visible facial behavior that accompanies disengagement
-- changes from active visible responding to reduced visible responding
-
-BODY / POSTURE
-- collapsed or slumped posture
-- body turning away
-- torso moving backward or withdrawing from the interaction
-- arms held close to the body when part of a broader withdrawal pattern
-- visible reduction in movement across the minute
-- prolonged unusual stillness when the interaction appears to continue
-
-GESTURES / MOVEMENT
-- shrugging
-- giving-up-like visible gestures
-- reduced gesturing or movement relative to earlier in the minute
-- hands or arms becoming less active when this occurs together with
-  other disengagement cues
-
-TEMPORAL RULE
--------------
-Use the full minute.
-
-Distinguish:
-- sustained or repeated patterns
-from
-- brief isolated movements.
-
-Do not decide from one sampled frame alone.
-
-IMPORTANT NON-INFERENCE RULES
------------------------------
-Do NOT automatically classify any of the following as withdrawal:
-- a brief gaze shift
-- briefly looking down
-- a normal pause
-- ordinary listening
-- ordinary thinking
-- a neutral facial expression
-- crossed arms by themselves
-- hands on lap by themselves
-- stillness by itself
-- a single shrug
-- a single smile
-- head orientation without supporting context
-
-These can occur without withdrawal.
-
-Also do NOT infer verbal withdrawal markers that cannot be observed
-visually here, including:
-- avoidant storytelling
-- abstract communication
-- topic shifting
-- verbal minimal responses
-- deferential verbal agreement
-- verbal denial
-- content/affect mismatch that requires knowing speech content
+Do not treat any single posture, gaze direction, facial configuration, gesture,
+or movement level as withdrawal by itself. Preserve temporal visual information
+that can help the supervised classifier, without assigning therapeutic meaning
+that cannot be established visually.
 
 {boundary_text}
 
-Your role is not to output the final label in text. Build an internal
-representation that preserves these 3RS-informed visual distinctions
-so that the supervised classifier can learn from the provided target.
+Visual evidence alone does not establish whether a rupture occurred. Use only
+directly visible patient behavior. Do not infer speech content, therapeutic topic,
+motivation, diagnosis, personality, hidden emotion, resistance, alliance quality,
+or unavailable therapist-patient dialogue. Do not use audio or transcript.
+
+Do not output a label in text. Build an internal representation so that the
+supervised classifier can learn from the provided human target.
 """.strip()
 
 

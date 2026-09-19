@@ -8,7 +8,12 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from finetune_qwen3_8b_wd_text import MANUAL_V2_SYSTEM_PROMPT, SYSTEM_PROMPTS, prepare_rows
+from finetune_qwen3_8b_wd_text import (
+    MANUAL_V2_SYSTEM_PROMPT,
+    MANUAL_V3_SYSTEM_PROMPT,
+    SYSTEM_PROMPTS,
+    prepare_rows,
+)
 from report_wd_ordinal_regression import report
 
 
@@ -19,6 +24,18 @@ class OrdinalTargetTests(unittest.TestCase):
                        "at least one clear marker", "1 =", "3 =", "5 ="):
             self.assertIn(phrase, MANUAL_V2_SYSTEM_PROMPT)
         self.assertNotIn("positive", MANUAL_V2_SYSTEM_PROMPT.lower())
+
+    def test_v3_rubric_operationalizes_high_salience_without_marker_counting(self):
+        self.assertIs(SYSTEM_PROMPTS["manual_detailed_v3"], MANUAL_V3_SYSTEM_PROMPT)
+        for phrase in (
+            "CLEARLY ELEVATED SALIENCE",
+            "VERY SALIENT / DOMINANT",
+            "Do not mechanically count markers or seconds",
+            "A weak or ambiguous additional cue must NOT automatically raise a 3 to a 4",
+            "Exact agreement about the narrow subtype is not required",
+            "Speaker labels may contain errors",
+        ):
+            self.assertIn(phrase, MANUAL_V3_SYSTEM_PROMPT)
 
     def test_two_ratings_become_a_distribution(self):
         rows = []

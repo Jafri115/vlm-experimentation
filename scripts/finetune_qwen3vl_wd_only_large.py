@@ -26,10 +26,42 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 import finetune_qwen3vl_rupture_pilot as base
 
-WD_PROMPT = """The images are chronological frames sampled across one labelled minute of a psychotherapy session.
+WD_PROMPT = """The images are chronological frames sampled across one labelled minute
+of a psychotherapy session.
+
 Focus only on the visible patient/person being observed.
-Create an internal visual representation useful for estimating WD_P: patient withdrawal salience on the continuous 3RS 1-5 scale.
-Use only visible patient behavior. Do not use audio or transcript.
+
+Create an internal visual representation useful for predicting the human-rated
+3RS v2022 Patient Moves Away (WD_P) salience score on the 1-5 scale.
+
+Represent directly visible patient behavior across the WHOLE MINUTE.
+Pay particular attention to:
+- persistence versus isolated behavior,
+- repetition,
+- strength/prominence of visible behavior,
+- changes across the sequence,
+- whether a behavioral pattern clearly shapes or dominates much of the minute.
+
+Preserve distinctions corresponding to:
+1 = little or no visual evidence associated with withdrawal
+2 = weak or ambiguous visual evidence
+3 = clear visual evidence
+4 = clearly elevated evidence through persistence, repetition, or prominence
+5 = very strong or dominant visual evidence across the minute
+
+A single weak visual cue should not by itself imply a high WD_P score.
+Multiple weak cues should not automatically imply a 4 or 5.
+A high score should be supported by strong, sustained, repeated, or dominant visual
+patterns across the minute.
+
+The target is the human 3RS WD_P rating. Visual behavior alone may not establish
+whether a rupture actually occurred, so do not invent therapeutic meaning that is
+not visible.
+
+Use only directly visible patient behavior.
+Do not infer speech content, motivation, diagnosis, personality, hidden emotion,
+or unavailable therapist-patient dialogue.
+Do not use audio or transcript.
 """
 
 

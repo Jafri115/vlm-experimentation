@@ -98,14 +98,37 @@ from peft import (
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
-PROMPT = """The images are chronological frames sampled from one labelled minute of a psychotherapy session.
+PROMPT = """The images are chronological frames sampled across one labelled minute
+of a psychotherapy session.
+
 Focus only on the visible patient/person being observed.
 
-Create an internal visual representation useful for estimating two 3RS patient rupture-marker salience scores:
-- WD_P: patient withdrawal salience
-- CF_P: patient confrontation salience
+Create an internal visual representation useful for estimating two human-rated
+3RS patient rupture-marker salience scores:
+- WD_P: patient withdrawal
+- CF_P: patient confrontation
 
-Use only visible patient behavior. Do not use audio or transcript.
+Represent directly visible behavior across the WHOLE MINUTE, including:
+- whether a visual pattern is isolated or repeated,
+- whether it persists across the minute,
+- how strongly it stands out,
+- whether the minute is visually dominated by a recurring behavioral pattern,
+- changes in behavior across the sequence.
+
+For the 1-5 salience scale, preserve distinctions useful for learning:
+1 = little or no supporting behavioral signal
+2 = weak or ambiguous signal
+3 = clear signal
+4 = clearly elevated through persistence, repetition, or prominence
+5 = very strong/dominant signal across the minute
+
+These are training-label salience distinctions, not permission to infer the patient's
+internal state from appearance.
+
+Use only directly visible patient behavior.
+Do not infer speech content, therapeutic topic, motivation, diagnosis, personality,
+hidden emotion, or the cause of a behavior.
+Do not use audio or transcript.
 """
 
 

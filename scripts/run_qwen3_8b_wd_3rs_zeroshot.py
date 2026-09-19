@@ -75,13 +75,21 @@ BOUNDARIES AND COUNTEREVIDENCE
 
 RATE SALIENCE ACROSS THE WHOLE EXCERPT
 1 = no withdrawal marker, or only one possible marker of very low intensity/clarity.
-2 = possible or mild withdrawal that is meaningfully above 1 but falls short of one
-    clear, moderately salient marker. Use 2 rather than 1 when contextual evidence
-    supports a plausible movement away despite limited clarity in the transcript.
-3 = somewhat salient: at least one clear marker of moderate intensity/clarity.
-4 = between somewhat and very salient.
-5 = very salient: very clear/intense movement away, often multiple markers or one
-    dominant marker sustained through much of the excerpt.
+2 = possible/unclear withdrawal: evidence suggests movement away, but it is weak,
+    ambiguous, brief, or equally compatible with ordinary therapeutic interaction.
+3 = clear withdrawal: at least one concrete, defensible movement-away marker. Exact
+    agreement about its narrow subtype is not required.
+4 = clearly elevated salience: at least one clear marker is present, and withdrawal
+    is sustained, repeated, notably intense, accumulates through additional meaningful
+    behavior, or clearly shapes much of the excerpt. One weak additional cue must not
+    automatically raise a 3 to a 4.
+5 = very salient/dominant withdrawal: movement away is very clear and/or intense and
+    organizes much of the interaction. Usually multiple clear behaviors make the
+    excerpt unmistakably withdrawal-shaped, but one exceptionally strong and sustained
+    marker can also justify 5.
+
+Do not mechanically count markers or seconds. Use 4 and 5 sparingly in 1-minute
+segments. Judge clarity, intensity, persistence/repetition, and dominance together.
 
 The evaluation target is WD_P present for scores 2-5 and absent only for score 1.
 Do not raise the threshold to score 3. Before choosing 1, actively check each

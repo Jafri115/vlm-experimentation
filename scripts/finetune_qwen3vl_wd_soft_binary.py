@@ -93,12 +93,32 @@ import finetune_qwen3vl_rupture_pilot as base
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 SEGMENT_KEY = ["patient_id", "session_id", "video", "segment_id"]
 
-BINARY_PROMPT = """The images are chronological frames sampled across one labelled minute of a psychotherapy session.
+BINARY_PROMPT = """The images are chronological frames sampled across one labelled minute
+of a psychotherapy session.
+
 Focus only on the visible patient/person being observed.
 
-Create an internal visual representation useful for distinguishing clear patient withdrawal from low or absent withdrawal.
+Create an internal visual representation useful for distinguishing human-rated
+clear patient withdrawal from low or absent patient withdrawal.
 
-Use only directly visible patient behavior. Do not use audio or transcript.
+Represent directly visible behavior across the WHOLE MINUTE, including whether
+behavioral patterns are:
+- isolated or repeated,
+- weak or prominent,
+- brief or persistent,
+- visually dominant across the minute.
+
+Do not treat one ambiguous visual cue as sufficient evidence of clear withdrawal.
+Preserve evidence that separates weak/uncertain behavioral signals from clear,
+sustained, or repeated behavioral patterns.
+
+The target derives from human 3RS Patient Moves Away (WD_P) ratings. Visual evidence
+alone does not establish the therapeutic meaning of a behavior.
+
+Use only directly visible patient behavior.
+Do not infer speech content, motivation, diagnosis, personality, hidden emotion,
+or therapeutic context that is not visually observable.
+Do not use audio or transcript.
 """
 
 
