@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WD transcript and speaker review</title>
+<style>
+body{font:15px system-ui;margin:0;background:#f3f5f7;color:#162c40}header{padding:16px 24px;background:#163750;color:white}h1{font-size:22px;margin:0 0 8px}main{padding:18px;max-width:1450px;margin:auto}button,select,input,textarea{font:inherit}button,select{padding:7px;border:1px solid #abbcc9;border-radius:5px;background:white;color:#143349}button{cursor:pointer}button:hover{background:#e7f1f8}.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.grid{display:grid;grid-template-columns:1fr 1.1fr;gap:18px}.card{background:white;padding:16px;border-radius:8px;border:1px solid #d5dfe6}video{width:100%;max-height:390px;background:#111}#subtitle{min-height:60px;padding:14px;background:#152333;color:white;font-size:20px;white-space:pre-wrap}#tablewrap{max-height:580px;overflow:auto}table{width:100%;border-collapse:collapse}th{position:sticky;top:0;background:#e8eff5}td,th{padding:6px;border-bottom:1px solid #d7e0e7;text-align:left}td input{width:80px}td textarea{width:98%;min-height:48px;box-sizing:border-box}.active{background:#fff0be}.muted{color:#566b7c;font-size:13px}#warnings{color:#8c3c09;background:#fff2df;padding:10px;margin:10px 0;white-space:pre-wrap}#notes{width:100%;box-sizing:border-box;min-height:70px}#status{font-weight:600}pre{white-space:pre-wrap;max-height:260px;overflow:auto;font-size:13px}#sourcepath{overflow-wrap:anywhere}@media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style>
+<header><h1>WD transcript and speaker review</h1>Listen, verify P / T, edit subtitles, export corrections.</header>
+<main>
+<div class="bar"><button id="previous">Previous</button><select id="segments" aria-label="Segment"></select><button id="next">Next</button><span id="status"></span></div>
+<div class="grid"><section class="card">
+<h2 id="title"></h2><p id="metadata"></p><p class="muted" id="sourcepath"></p>
+<label>Select video/audio: <input id="mediafile" type="file" accept="video/*,audio/*,.mkv"></label>
+<p class="muted">Media stays on this computer. Select the file shown above. Browsers may not support every codec; use MP4 or open the SRT in Subtitle Edit.</p>
+<div class="bar"><label>Media <select id="mode"><option value="session">Full session</option><option value="clip">Segment clip</option></select></label><label>File starts at session second <input id="origin" type="number" step="0.001" value="0" style="width:95px"></label></div>
+<video id="player" controls preload="metadata"></video><div id="subtitle"></div>
+<div class="bar"><button id="playwindow">Play rating window</button><button id="back">−2 seconds</button><button id="forward">+2 seconds</button><label>Speed <select id="speed"><option>.75</option><option selected>1</option><option>1.25</option><option>1.5</option></select></label><span id="clock"></span></div>
+<div id="warnings"></div>
+<label>Verification notes (speaker identity, offset, uncertainty):<textarea id="notes"></textarea></label>
+<details><summary>Original transcript and rating interval</summary><pre id="original"></pre></details>
+</section><section class="card">
+<div class="bar"><button id="sessionSrt">Save session SRT</button><button id="clipSrt">Save clip SRT</button><button id="swap">Swap all P / T</button><button id="reset">Reset this segment</button><button id="add">Add cue</button></div>
+<p class="muted">Start/end are absolute session seconds. Click ▶ to hear a cue. End times are initially estimated, not measured. Edit or delete cues after listening.</p>
+<div id="tablewrap"><table><thead><tr><th>Play</th><th>Start</th><th>End</th><th>Speaker</th><th>Text</th><th></th></tr></thead><tbody id="cues"></tbody></table></div>
+</section></div>
+<div class="bar" style="margin-top:18px"><button id="export">Save all corrections JSON</button><label>Resume review: <input id="import" type="file" accept=".json"></label></div>
+<p class="muted">Edits are not written to your dataset. Download corrections before closing. Ratings are displayed for verification; they are not edited here. Boundary-crossing cues are trimmed only in clip SRT exports.</p>
+</main>
+<script id="records" type="application/json">__RECORDS_JSON__</script>
+<script>
+'use strict';
+const original=JSON.parse(document.getElementById('records').textContent);
+let records=structuredClone(original),current=0,dirty=false,mediaURL=null,loadedName='',stopAt=null;
+const $=id=>document.getElementById(id),r=()=>records[current],player=$('player');
+function mark(){dirty=true;$('status').textContent='Unsaved edits';}
+function download(name,text,type){const u=URL.createObjectURL(new Blob([text],{type}));const a=document.createElement('a');a.href=u;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);}
+function timestamp(t){let ms=Math.max(0,Math.round(t*1000)),sec=Math.floor(ms/1000),min=Math.floor(sec/60),hr=Math.floor(min/60);return `${String(hr).padStart(2,'0')}:${String(min%60).padStart(2,'0')}:${String(sec%60).padStart(2,'0')},${String(ms%1000).padStart(3,'0')}`;}
+function seek(sessionTime,play=false,end=null){if(!mediaURL){alert('Select the matching video or audio first.');return;}const t=sessionTime-Number($('origin').value);if(t<0){alert('This cue begins before the selected media. Check the media offset.');return;}stopAt=end;player.currentTime=t;if(play)player.play().catch(e=>alert(e.message));}
+function render(){player.pause();stopAt=null;const row=r();$('segments').value=String(current);$('title').textContent=row.id;
+$('metadata').textContent=`Human WD_P: ${row.r1} / ${row.r2} · ${row.provider} · Rating window ${timestamp(row.start)}–${timestamp(row.end)} (end exclusive)`;
+$('sourcepath').textContent='Expected media: '+row.video+' — '+row.video_path;
+$('warnings').textContent=['Cue ends estimated from next onset. Verify against the audio.',...row.flags,row.source_flags,loadedName&&loadedName!==row.video?'Selected file: '+loadedName+' — confirm it belongs to this session.':''].filter(Boolean).join('\n');
+$('notes').value=row.notes;$('original').textContent=`Source rating interval: ${row.annotation_start}–${row.annotation_end}\n\n${row.raw}`;
+if($('mode').value==='clip')$('origin').value=row.start;
+const body=$('cues');body.replaceChildren();row.cues.forEach((c,i)=>{const tr=document.createElement('tr');tr.dataset.index=i;
+const cell=()=>{const td=document.createElement('td');tr.append(td);return td;};const play=document.createElement('button');play.textContent='▶';play.onclick=()=>seek(c.start,true,c.end);cell().append(play);
+for(const key of ['start','end']){const input=document.createElement('input');input.type='number';input.step='.001';input.min='0';input.value=c[key];input.setAttribute('aria-label',`${key} cue ${i+1}`);input.onchange=()=>{const v=Number(input.value);if(!Number.isFinite(v)||v<0){alert('Use a nonnegative time.');input.value=c[key];return;}c[key]=v;c.end_estimated=false;mark();};cell().append(input);}
+const role=document.createElement('select');for(const label of ['P','T','U','?']){const option=document.createElement('option');option.textContent=label;role.append(option);}role.value=c.role;role.onchange=()=>{c.role=role.value;mark();};cell().append(role);
+const text=document.createElement('textarea');text.value=c.text;text.setAttribute('aria-label',`Text cue ${i+1}`);text.oninput=()=>{c.text=text.value;mark();};cell().append(text);
+const del=document.createElement('button');del.textContent='×';del.title='Delete cue';del.onclick=()=>{if(confirm('Delete this cue?')){row.cues.splice(i,1);mark();render();}};cell().append(del);body.append(tr);});$('subtitle').textContent='';}
+original.forEach((row,i)=>{const option=document.createElement('option');option.value=i;option.textContent=row.id;$('segments').append(option);});
+$('segments').onchange=()=>{current=Number($('segments').value);render();};$('previous').onclick=()=>{current=Math.max(0,current-1);render();};$('next').onclick=()=>{current=Math.min(records.length-1,current+1);render();};
+$('mediafile').onchange=()=>{const file=$('mediafile').files[0];if(!file)return;if(mediaURL)URL.revokeObjectURL(mediaURL);mediaURL=URL.createObjectURL(file);loadedName=file.name;player.src=mediaURL;player.onloadedmetadata=()=>{const target=r().start-Number($('origin').value);if(target>=0&&target<player.duration)player.currentTime=target;};render();};
+$('mode').onchange=()=>{$('origin').value=$('mode').value==='clip'?r().start:0;};
+$('playwindow').onclick=()=>seek(r().start,true,r().end);$('back').onclick=()=>{player.currentTime=Math.max(0,player.currentTime-2);};$('forward').onclick=()=>{player.currentTime+=2;};$('speed').onchange=()=>player.playbackRate=Number($('speed').value);
+player.ontimeupdate=()=>{const now=player.currentTime+Number($('origin').value);$('clock').textContent=timestamp(now);$('subtitle').textContent=r().cues.filter(c=>now>=c.start&&now<c.end).map(c=>c.role+': '+c.text).join('\n');document.querySelectorAll('#cues tr').forEach(tr=>{const c=r().cues[Number(tr.dataset.index)];tr.classList.toggle('active',now>=c.start&&now<c.end);});if(stopAt!==null&&now>=stopAt){player.pause();stopAt=null;}};
+$('notes').oninput=()=>{r().notes=$('notes').value;mark();};
+$('swap').onclick=()=>{if(confirm('Swap P and T for every cue in this segment?')){r().cues.forEach(c=>c.role=c.role==='P'?'T':c.role==='T'?'P':c.role);mark();render();}};
+$('reset').onclick=()=>{if(confirm('Discard edits for this segment?')){records[current]=structuredClone(original[current]);mark();render();}};
+$('add').onclick=()=>{const start=mediaURL?player.currentTime+Number($('origin').value):r().start;r().cues.push({start,end:start+1,role:'U',text:'',end_estimated:false});mark();render();};
+function exportSrt(clip){const row=r();if(row.cues.some(c=>!Number.isFinite(c.start)||!Number.isFinite(c.end)||c.end<=c.start)){alert('Every cue must have a valid end later than its start.');return;}const blocks=[];[...row.cues].sort((a,b)=>a.start-b.start).forEach(c=>{let s=c.start,e=c.end;if(clip){s=Math.max(s,row.start);e=Math.min(e,row.end);}if(e<=s)return;const origin=clip?row.start:0;blocks.push(`${blocks.length+1}\n${timestamp(s-origin)} --> ${timestamp(e-origin)}\n${c.role}: ${c.text}\n`);});download(row.id+(clip?'.clip.corrected.srt':'.session.corrected.srt'),'\ufeff'+blocks.join('\n'),'application/x-subrip');}
+$('sessionSrt').onclick=()=>exportSrt(false);$('clipSrt').onclick=()=>exportSrt(true);
+$('export').onclick=()=>{download('wd_subtitle_corrections.json',JSON.stringify({version:1,records},null,2),'application/json');dirty=false;$('status').textContent='Corrections downloaded';};
+$('import').onchange=async()=>{try{const data=JSON.parse(await $('import').files[0].text());if(data.version!==1||!Array.isArray(data.records)||data.records.length!==original.length)throw Error('Wrong review file');for(let i=0;i<original.length;i++){const x=data.records[i];if(x.id!==original[i].id||!Array.isArray(x.cues)||x.cues.some(c=>!Number.isFinite(c.start)||!Number.isFinite(c.end)||c.start<0||c.end<=c.start||typeof c.text!=='string'||!['P','T','U','?'].includes(c.role)))throw Error('Invalid segment or cue');}records=original.map((x,i)=>({...structuredClone(x),cues:data.records[i].cues,notes:String(data.records[i].notes||'')}));dirty=false;$('status').textContent='Review loaded';render();}catch(e){alert(e.message);}};
+window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});render();
+</script></html>
