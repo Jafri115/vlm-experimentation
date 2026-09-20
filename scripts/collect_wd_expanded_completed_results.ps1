@@ -41,9 +41,9 @@ $specs = @(
     @{Name='Training and validation plots'; Folder='wd_training_plots_expanded'; Marker='llm_consensus_train_validation.png'; Group='expanded main'},
 
     # Better ordinal-regression experiment, already complete before the main queue.
-    @{Name='Qwen3-8B ordinal regression'; Folder='llm_wd_ordinal_qwen3_8b_expanded_cv'; Marker='llm_wd_ordinal_qwen3_8b_expanded_cv\oof_predictions.csv'; Group='ordinal regression'},
-    @{Name='Qwen3-14B ordinal regression'; Folder='llm_wd_ordinal_qwen3_14b_expanded_cv'; Marker='llm_wd_ordinal_qwen3_14b_expanded_cv\oof_predictions.csv'; Group='ordinal regression'},
-    @{Name='Ordinal regression report'; Folder='wd_ordinal_regression_expanded_report'; Marker='ordinal_model_comparison.md'; Group='ordinal regression'},
+    @{Name='Qwen3-8B ordinal regression'; Folder='llm_wd_ordinal_qwen3_8b_expanded_cv'; Marker='oof_predictions.csv'; Group='ordinal regression'},
+    @{Name='Qwen3-14B ordinal regression'; Folder='llm_wd_ordinal_qwen3_14b_expanded_cv'; Marker='oof_predictions.csv'; Group='ordinal regression'},
+    @{Name='Ordinal regression report'; Folder='wd_ordinal_regression_expanded_report'; Marker=''; Group='ordinal regression'},
 
     # Second phase of the expanded parent queue. These are included only when complete.
     @{Name='VLM zero-shot'; Folder='vlm_wd_zero_expanded_cv'; Marker='oof_predictions.csv'; Group='pending visual phase'},
@@ -55,7 +55,24 @@ $specs = @(
     @{Name='Expanded label distribution'; Folder='wd_expanded_label_distribution'; Marker=''; Group='cohort'}
 )
 
-$allowedExtensions = @('.json', '.csv', '.png', '.jpg', '.jpeg', '.svg', '.md', '.txt', '.log')
+$presentationExtensions = @('.png', '.jpg', '.jpeg', '.svg', '.md')
+$compactFileNames = @(
+    'oof_predictions.csv',
+    'paired_predictions.csv',
+    'final_summary.json',
+    'summary.json',
+    'comparison_summary.json',
+    'cv_summary.json',
+    'run_config.json',
+    'preparation.json',
+    'training_history.csv',
+    'learning_curves.csv',
+    'test_metrics.json',
+    'metrics.json',
+    'regression_metrics.json',
+    'command.txt',
+    'queue.log'
+)
 $excludedDirectories = @('best_adapter', 'checkpoint', 'checkpoints', 'frame_cache_16', '__pycache__')
 $statusRows = New-Object System.Collections.Generic.List[object]
 $manifestRows = New-Object System.Collections.Generic.List[object]
@@ -65,12 +82,17 @@ function Copy-LightweightResultFolder {
 
     $source = Join-Path $OutputRoot $FolderName
     $targetRoot = Join-Path $Destination $FolderName
+    $reportFolder = $FolderName -match '(report|overview|distribution)$'
     $copied = 0
     Get-ChildItem -LiteralPath $source -Recurse -File | Where-Object {
         $relative = $_.FullName.Substring($source.Length).TrimStart('\', '/')
         $parts = $relative -split '[\\/]'
         $blocked = @($parts | Where-Object { $excludedDirectories -contains $_ }).Count -gt 0
-        (-not $blocked) -and ($allowedExtensions -contains $_.Extension.ToLowerInvariant())
+        $extension = $_.Extension.ToLowerInvariant()
+        $compactResult = $compactFileNames -contains $_.Name
+        $presentationFile = $presentationExtensions -contains $extension
+        $reportTable = $reportFolder -and ($extension -in @('.csv', '.json', '.txt'))
+        (-not $blocked) -and ($compactResult -or $presentationFile -or $reportTable)
     } | ForEach-Object {
         $relative = $_.FullName.Substring($source.Length).TrimStart('\', '/')
         $target = Join-Path $targetRoot $relative
@@ -98,6 +120,13 @@ foreach ($spec in $specs) {
         } else {
             $markerPath = Join-Path $source $spec.Marker
             $complete = Test-Path -LiteralPath $markerPath -PathType Leaf
+            if (-not $complete) {
+                # Some transferred historical runs contain one extra directory named
+                # like the experiment root. Accept the aggregate marker anywhere below
+                # the root while still requiring the combined OOF/summary filename.
+                $markerLeaf = Split-Path -Leaf $spec.Marker
+                $complete = @(Get-ChildItem -LiteralPath $source -Recurse -File -Filter $markerLeaf -ErrorAction SilentlyContinue).Count -gt 0
+            }
         }
     }
 
@@ -178,4 +207,3 @@ if ($pendingRows.Count -gt 0) {
     Write-Host 'Incomplete/not-found experiments:'
     $pendingRows | Format-Table experiment, status, source_folder -AutoSize
 }
-
