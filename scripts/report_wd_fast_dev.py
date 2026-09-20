@@ -73,6 +73,14 @@ def main(args) -> None:
             "auroc": metrics.get("auroc"),
             "auprc": metrics.get("auprc"),
             "brier": metrics.get("brier"),
+            "capped_severity_mae": metrics.get("capped_severity_mae"),
+            "capped_severity_rmse": metrics.get("capped_severity_rmse"),
+            "capped_severity_spearman": metrics.get("capped_severity_spearman"),
+            "ge_2_balanced_accuracy": metrics.get("ge_2_consensus_balanced_accuracy"),
+            "ge_2_auroc": metrics.get("ge_2_consensus_auroc"),
+            "ge_3_balanced_accuracy": metrics.get("ge_3_consensus_balanced_accuracy"),
+            "ge_3_auroc": metrics.get("ge_3_consensus_auroc"),
+            "three_level_balanced_accuracy": metrics.get("three_level_balanced_accuracy"),
         })
     if not records:
         raise SystemExit(f"No completed validation-only runs under {run_root}")
@@ -105,7 +113,10 @@ def main(args) -> None:
         writer.writerows(records)
 
     columns = ["experiment", "mode", "train_n", "validation_n", "mae", "spearman",
-               "balanced_accuracy", "auroc", "prediction_min", "prediction_max",
+               "capped_severity_mae", "capped_severity_spearman",
+               "balanced_accuracy", "auroc", "ge_2_balanced_accuracy", "ge_2_auroc",
+               "ge_3_balanced_accuracy", "ge_3_auroc", "three_level_balanced_accuracy",
+               "prediction_min", "prediction_max",
                "mae_improvement_vs_baseline", "spearman_improvement_vs_baseline",
                "balanced_accuracy_improvement_vs_baseline", "comparable_to_baseline"]
     lines = [
