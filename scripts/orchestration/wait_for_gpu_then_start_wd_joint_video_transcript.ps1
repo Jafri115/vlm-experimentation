@@ -21,6 +21,25 @@ function Log([string]$Message) {
     "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message" | Tee-Object -FilePath $Log -Append
 }
 
+function Get-WorkloadGpuPids {
+    # On Windows WDDM, nvidia-smi --query-compute-apps also reports desktop
+    # processes (Explorer, Edge, VS Code, etc.). Only treat likely ML/audio
+    # workloads as busy; otherwise the scheduler can never become idle.
+    $ids = @(& nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>$null |
+        ForEach-Object { [int]($_.Trim()) } |
+        Where-Object { $_ -gt 0 })
+    $busy = @()
+    foreach ($id in $ids) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $id" -ErrorAction SilentlyContinue
+        if ($null -eq $process) { continue }
+        $text = "$($process.Name) $($process.CommandLine)".ToLowerInvariant()
+        if ($text -match "python|torch|transcrib|finetune|qwen|asr|transformers|accelerate") {
+            $busy += $id
+        }
+    }
+    return @($busy | Sort-Object -Unique)
+}
+
 if ($Worker) {
     $start = Join-Path $Repo "scripts\orchestration\start_wd_joint_video_transcript_background.ps1"
     $args = @(
@@ -51,7 +70,7 @@ if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
 Log "Scheduler started; waiting for $IdleMinutes continuous GPU-idle minutes"
 $idleSeconds = 0
 while ($true) {
-    $pids = @(& nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>$null | Where-Object { $_.Trim() })
+    $pids = @(Get-WorkloadGpuPids)
     if ($pids.Count -eq 0) {
         $idleSeconds += $PollSeconds
         Log "GPU idle for $([math]::Min($idleSeconds, $IdleMinutes * 60))/$($IdleMinutes * 60) seconds"
