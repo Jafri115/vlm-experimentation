@@ -101,11 +101,46 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from vlm import finetune_qwen3vl_rupture_pilot as base
+try:
+    from vlm import finetune_qwen3vl_rupture_pilot as base
+except ModuleNotFoundError:
+    # Support direct execution as `python scripts/vlm/<script>.py`.
+    import finetune_qwen3vl_rupture_pilot as base
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 SEGMENT_KEY = ["patient_id", "session_id", "video", "segment_id"]
+
+JOINT_VIDEO_TRANSCRIPT_PROMPT = """You are assessing PATIENT WITHDRAWAL (WD_P) in one approximately one-minute segment of a German psychotherapy session.
+
+You receive sampled patient video frames and a transcript from the same segment. T identifies the therapist and P identifies the patient.
+
+Assess evidence of patient withdrawal from the therapeutic interaction using both the dialogue and visible patient behaviour.
+
+Use therapist speech as context for understanding the patient's response. Rate only patient withdrawal. Do not rate therapist withdrawal, confrontation, repair, diagnosis or general treatment quality.
+
+Do not automatically interpret looking away, looking down, limited movement, a neutral expression, short answers or agreement as withdrawal. Consider whether the available evidence supports disengagement or avoidance in the therapeutic interaction.
+
+Similarly, distress, sadness, reflection or discussing a difficult topic alone does not establish withdrawal.
+
+The transcript may contain transcription or speaker-label errors. Do not invent missing words or silently repair ambiguous speech.
+
+The video contains sampled frames. Do not infer precise movement, continuous gaze, pause duration or vocal tone that the inputs do not establish.
+
+Consider how verbal and visual evidence support or qualify each other. Do not assume that the two modalities must agree.
+
+Assess only the supplied segment and its available context."""
+
+
+def build_joint_prompt(transcript_text: str) -> str:
+    transcript = str(transcript_text).strip()
+    if not transcript:
+        raise ValueError("Joint input has an empty transcript.")
+    return (
+        JOINT_VIDEO_TRANSCRIPT_PROMPT
+        + "\n\nSPEAKER-LABELLED TRANSCRIPT (same segment):\n"
+        + transcript
+    )
 
 def build_binary_prompt(positive_threshold: float) -> str:
     """
@@ -595,6 +630,9 @@ def prepare_inputs(
     frames: Sequence[Image.Image],
     device: torch.device,
     positive_threshold: float,
+    input_mode: str = "video",
+    transcript_text: Optional[str] = None,
+    max_input_tokens: int = 0,
 ):
     content = [
         {
@@ -604,12 +642,16 @@ def prepare_inputs(
         for frame in frames
     ]
 
+    prompt_text = (
+        build_joint_prompt(transcript_text)
+        if input_mode == "joint"
+        else build_binary_prompt(positive_threshold)
+    )
+
     content.append(
         {
             "type": "text",
-            "text": build_binary_prompt(
-                positive_threshold
-            ),
+            "text": prompt_text,
         }
     )
 
@@ -627,6 +669,13 @@ def prepare_inputs(
         return_dict=True,
         return_tensors="pt",
     )
+
+    token_count = int(inputs["attention_mask"].sum().item())
+    if max_input_tokens > 0 and token_count > max_input_tokens:
+        raise RuntimeError(
+            f"Input requires {token_count} tokens, exceeding the explicit "
+            f"budget of {max_input_tokens}. No silent truncation was applied."
+        )
 
     moved = {}
 
@@ -684,6 +733,14 @@ def pool_hidden(
             / weights.sum(dim=1)
             .clamp_min(1.0)
         )
+
+    if pooling == "last_token":
+        # The final valid assistant-start token follows all images and transcript.
+        # Its causal state can therefore integrate both modalities. No target label
+        # is placed in the input, and padding is excluded by valid_mask.
+        last_index = valid_mask.long().sum(dim=1).sub(1).clamp_min(0)
+        batch_index = torch.arange(hidden.shape[0], device=hidden.device)
+        return hidden[batch_index, last_index]
 
     if pooling == "mean_image":
         input_ids = inputs.get(
@@ -778,12 +835,18 @@ def predict_logits(
     device,
     pooling: str,
     positive_threshold: float,
+    input_mode: str = "video",
+    transcript_text: Optional[str] = None,
+    max_input_tokens: int = 0,
 ):
     inputs = prepare_inputs(
         processor,
         frames,
         device,
         positive_threshold,
+        input_mode=input_mode,
+        transcript_text=transcript_text,
+        max_input_tokens=max_input_tokens,
     )
 
     backbone = base.get_backbone(
@@ -1242,6 +1305,9 @@ def evaluate(
                 device=device,
                 pooling=args.pooling,
                 positive_threshold=args.positive_threshold,
+                input_mode=args.input_mode,
+                transcript_text=getattr(row, args.transcript_column, None),
+                max_input_tokens=args.max_input_tokens,
             )
 
             probability = float(
@@ -1255,7 +1321,9 @@ def evaluate(
 
             record = {
                 "sample_id": row.sample_id,
+                "segment_uid": getattr(row, "segment_uid", row.sample_id),
                 "patient_id": row.patient_id,
+                "session_id": row.session_id,
                 "video": row.video,
                 "segment_id": int(
                     row.segment_id
@@ -1283,6 +1351,13 @@ def evaluate(
                     row.WD_binary_disagreement
                 ),
                 "WD_probability": probability,
+                "outer_fold": args.outer_fold,
+                "split": split_name,
+                "y_true": (
+                    int(row.WD_consensus)
+                    if pd.notna(row.WD_consensus)
+                    else np.nan
+                ),
             }
 
             rows.append(
@@ -1891,8 +1966,22 @@ def train(
                 if float(args.positive_threshold) == 2.0
                 else "clear/somewhat-salient withdrawal (rating >=3)"
             ),
-            "prompt_text": build_binary_prompt(
-                args.positive_threshold
+            "prompt_text": (
+                build_binary_prompt(args.positive_threshold)
+                if args.input_mode == "video"
+                else JOINT_VIDEO_TRANSCRIPT_PROMPT
+            ),
+            "experiment_name": (
+                "joint video-transcript fusion"
+                if args.input_mode == "joint"
+                else "video-only VLM"
+            ),
+            "pooling_rationale": (
+                "final non-padding assistant-start token follows all visual and "
+                "transcript tokens and can causally attend to both; no target token "
+                "is present"
+                if args.pooling == "last_token"
+                else "baseline pooling retained"
             ),
             "resolved_pos_weight": (
                 pos_weight
@@ -2016,6 +2105,9 @@ def train(
                     device=device,
                     pooling=args.pooling,
                     positive_threshold=args.positive_threshold,
+                    input_mode=args.input_mode,
+                    transcript_text=getattr(row, args.transcript_column, None),
+                    max_input_tokens=args.max_input_tokens,
                 )
 
                 loss = loss_fn(
@@ -2543,6 +2635,14 @@ def train(
         )
     )
 
+    best_val_predictions["selected_threshold"] = float(best_threshold)
+    best_val_predictions["prediction_at_0_5"] = (
+        best_val_predictions["WD_probability"] >= 0.5
+    ).astype(int)
+    best_val_predictions["prediction_at_selected_threshold"] = (
+        best_val_predictions["WD_probability"] >= best_threshold
+    ).astype(int)
+
     best_val_predictions.to_csv(
         output_dir
         / "val_predictions.csv",
@@ -2582,6 +2682,14 @@ def train(
         )
     )
 
+    test_predictions["selected_threshold"] = float(best_threshold)
+    test_predictions["prediction_at_0_5"] = (
+        test_predictions["WD_probability"] >= 0.5
+    ).astype(int)
+    test_predictions["prediction_at_selected_threshold"] = (
+        test_predictions["WD_probability"] >= best_threshold
+    ).astype(int)
+
     test_predictions.to_csv(
         output_dir
         / "test_predictions.csv",
@@ -2592,6 +2700,7 @@ def train(
         test_rows,
         threshold=best_threshold,
     )
+    test_metrics_at_0_5 = compute_metrics(test_rows, threshold=0.5)
 
     print(
         "\nTEST METRICS"
@@ -2726,6 +2835,7 @@ def train(
             "test_metrics": (
                 test_metrics
             ),
+            "test_metrics_at_0_5": test_metrics_at_0_5,
         },
     )
 
@@ -2862,8 +2972,34 @@ def make_parser():
         choices=[
             "mean_all",
             "mean_image",
+            "last_token",
         ],
         default="mean_all",
+    )
+
+    p.add_argument(
+        "--input-mode",
+        choices=["video", "joint"],
+        default="video",
+        help="joint appends the exact same-segment speaker-labelled transcript.",
+    )
+
+    p.add_argument(
+        "--transcript-column",
+        default="transcript_text",
+    )
+
+    p.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=0,
+        help="Fail above this processed-token budget; 0 applies no cap.",
+    )
+
+    p.add_argument(
+        "--outer-fold",
+        type=int,
+        default=0,
     )
 
     p.add_argument(
@@ -3004,6 +3140,12 @@ def main():
         args.output_dir
     )
 
+    if args.input_mode == "joint" and args.pooling != "last_token":
+        raise ValueError(
+            "Joint video-transcript fusion requires --pooling last_token so the "
+            "pooled causal state follows both modalities."
+        )
+
     print(
         "QWEN3-VL WD_P "
         "HARD / SOFT BINARY QLORA"
@@ -3046,6 +3188,26 @@ def main():
         ),
         output_dir=output_dir,
     )
+
+    if args.input_mode == "joint":
+        if args.transcript_column not in manifest.columns:
+            raise RuntimeError(
+                f"Joint manifest lacks transcript column: {args.transcript_column}"
+            )
+        text = manifest[args.transcript_column].fillna("").astype(str).str.strip()
+        missing_text = text.eq("")
+        missing_roles = ~text.str.contains(r"\b[TP]\s*:", regex=True)
+        audit = manifest[["sample_id", "patient_id", "session_id", "split"]].copy()
+        audit["transcript_missing"] = missing_text
+        audit["speaker_labels_missing"] = missing_roles
+        audit.to_csv(output_dir / "joint_input_audit.csv", index=False)
+        if missing_text.any() or missing_roles.any():
+            raise RuntimeError(
+                "Joint input audit failed: "
+                f"empty transcripts={int(missing_text.sum())}, "
+                f"missing T/P speaker labels={int(missing_roles.sum())}. "
+                "See joint_input_audit.csv; rows were not silently excluded."
+            )
 
     if args.prepare_only:
         if args.target_mode == "consensus":
