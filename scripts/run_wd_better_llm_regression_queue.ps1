@@ -78,9 +78,10 @@ $ErrorActionPreference = 'Continue'
 $preflightExit = $LASTEXITCODE
 $ErrorActionPreference = $previousPreference
 if ($preflightExit -ne 0) { throw "Python/CUDA preflight failed; see $preflightLog" }
-Write-Queue 'Better LLM regression queue started (14B primary, then 8B objective control)'
+Write-Queue 'Better LLM regression queue started (Mistral 24B, 14B, then 8B objective control)'
 
 $models = @(
+    @{ Tag='mistral_small_24b'; Id='mistralai/Mistral-Small-3.2-24B-Instruct-2506'; LearningRate='3e-5'; EvalBatch='1' },
     @{ Tag='qwen3_14b'; Id='Qwen/Qwen3-14B'; LearningRate='3e-5'; EvalBatch='1' },
     @{ Tag='qwen3_8b'; Id='Qwen/Qwen3-8B'; LearningRate='3e-5'; EvalBatch='2' }
 )
@@ -111,6 +112,7 @@ foreach ($model in $models) {
 $reportRoot = Join-Path $Repo 'output\wd_ordinal_regression_expanded_report'
 Invoke-Checked 'report_ordinal_regression' @(
     'scripts/report_wd_ordinal_regression.py', '--master-root', $MasterRoot,
+    '--extra', ('Mistral-Small-24B ordinal=' + (Join-Path $Repo 'output\llm_wd_ordinal_mistral_small_24b_expanded_cv\oof_predictions.csv')),
     '--output', $reportRoot
 ) (Join-Path $reportRoot 'ordinal_regression_report.md')
 Write-Queue 'Better LLM regression queue finished'

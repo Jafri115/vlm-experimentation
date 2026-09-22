@@ -41,6 +41,7 @@ $specs = @(
     @{Name='Training and validation plots'; Folder='wd_training_plots_expanded'; Marker='llm_consensus_train_validation.png'; Group='expanded main'},
 
     # Better ordinal-regression experiment, already complete before the main queue.
+    @{Name='Mistral Small 3.2 24B ordinal regression'; Folder='llm_wd_ordinal_mistral_small_24b_expanded_cv'; Marker='oof_predictions.csv'; Group='ordinal regression'},
     @{Name='Qwen3-8B ordinal regression'; Folder='llm_wd_ordinal_qwen3_8b_expanded_cv'; Marker='oof_predictions.csv'; Group='ordinal regression'},
     @{Name='Qwen3-14B ordinal regression'; Folder='llm_wd_ordinal_qwen3_14b_expanded_cv'; Marker='oof_predictions.csv'; Group='ordinal regression'},
     @{Name='Ordinal regression report'; Folder='wd_ordinal_regression_expanded_report'; Marker=''; Group='ordinal regression'},

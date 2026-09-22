@@ -169,6 +169,7 @@ def main(root: Path) -> None:
         ("Qwen3-8B standard regression", "llm_wd_regression_expanded_cv"),
         ("Qwen3-8B ordinal", "llm_wd_ordinal_qwen3_8b_expanded_cv"),
         ("Qwen3-14B ordinal", "llm_wd_ordinal_qwen3_14b_expanded_cv"),
+        ("Mistral Small 3.2 24B ordinal", "llm_wd_ordinal_mistral_small_24b_expanded_cv"),
     )
     for label, folder in regression_sources:
         path = first_recursive(root / folder, "oof_predictions.csv")
