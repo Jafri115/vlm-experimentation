@@ -6,7 +6,7 @@ import numpy as np
 from pathlib import Path
 import pandas as pd
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from wd_context_inputs import build_context,encode_row,TARGET_HEADER
+from llm.wd_context_inputs import build_context,encode_row,TARGET_HEADER
 from report_wd_context_experiment import markdown_table
 
 
@@ -60,7 +60,7 @@ class ContextTests(unittest.TestCase):
     def test_preparation_review_and_report(self):
         from prepare_wd_context_experiment import prepare,export_review
         from report_wd_context_experiment import report
-        from finetune_qwen3_8b_wd_text import read_jsonl,prepare_rows
+        from llm.finetune_qwen3_8b_wd_text import read_jsonl,prepare_rows
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);master=root/'master';master.mkdir();out=root/'out';source=root/'source'
             d=pd.DataFrame({'sample_id':[f's{i}' for i in range(20)],'segment_uid':[f'u{i}' for i in range(20)],

@@ -8,14 +8,14 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from finetune_qwen3_8b_wd_text import (
+from llm.finetune_qwen3_8b_wd_text import (
     MANUAL_V2_SYSTEM_PROMPT,
     MANUAL_V3_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
     cumulative_metrics,
     prepare_rows,
 )
-from report_wd_ordinal_regression import report
+from analysis.report_wd_ordinal_regression import report
 
 
 class OrdinalTargetTests(unittest.TestCase):
