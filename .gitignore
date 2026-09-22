@@ -238,6 +238,7 @@ test_v8_1_qwen30_load.ps1
 *.ps1
 !scripts/orchestration/run_wd_joint_video_transcript_queue.ps1
 !scripts/orchestration/start_wd_joint_video_transcript_background.ps1
+!scripts/orchestration/wait_for_gpu_then_start_wd_joint_video_transcript.ps1
 !scripts/run_wd_cumulative_ordinal_expanded_queue.ps1
 !scripts/start_wd_cumulative_ordinal_background.ps1
 !scripts/run_wd_pending_repaired_queue.ps1
