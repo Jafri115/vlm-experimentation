@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analysis.wd_presentation_common import exclusive_lock, sha, write_json, load_folds
+from wd_presentation_common import exclusive_lock, sha, write_json, load_folds
 
 
 def main(args):
@@ -41,7 +41,7 @@ def main(args):
             'manifests':[sha(p) for _,_,p in folds],
             'code':{name:sha(repo/'scripts'/name) for name in [
                 'run_wd_context_experiment.py','prepare_wd_context_experiment.py',
-                'llm/wd_context_inputs.py','llm/finetune_qwen3_8b_wd_text.py','orchestration/run_wd_tfidf_baselines.py']}}
+                'llm/wd_context_inputs.py','llm/finetune_qwen3_8b_wd_text.py','run_wd_tfidf_baselines.py']}}
         fingerprint=hashlib.sha256(json.dumps(signature,sort_keys=True).encode()).hexdigest()
         provenance=root/'experiment.json'
         if provenance.exists() and json.loads(provenance.read_text())['fingerprint']!=fingerprint:

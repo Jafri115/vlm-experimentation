@@ -1,15 +1,12 @@
 """Build target-only/previous-context inputs on the frozen cohort; fit paired TF-IDF."""
 import argparse
-import sys
 from pathlib import Path
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from llm.wd_context_inputs import build_context
-from analysis.wd_presentation_common import load_folds,sha,write_json
-from orchestration.run_wd_tfidf_baselines import fit_fold
+from wd_presentation_common import load_folds,sha,write_json
+from run_wd_tfidf_baselines import fit_fold
 
 
 def prepare(master_root,output,max_gap=1.0,fit_baselines=True):

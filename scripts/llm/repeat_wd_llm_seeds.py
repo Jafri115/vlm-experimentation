@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from analysis.wd_presentation_common import load_folds, sha, write_json, exclusive_lock
+from wd_presentation_common import load_folds, sha, write_json, exclusive_lock
 
 
 def main(args):
