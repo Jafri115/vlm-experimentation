@@ -218,6 +218,10 @@ __marimo__/
 .streamlit/secrets.toml
 output
 data
+!scripts/data/
+!scripts/data/**
+scripts/data/**/__pycache__/
+scripts/data/**/*.pyc
 .venv_internvl/
 reference_crops/
 old scripts/
