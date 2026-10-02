@@ -265,3 +265,4 @@ models/face_detection_yunet/face_detection_yunet_2026may.onnx
 /models/llama_cpp_*/
 tmp/wd_audit/
 tmp/
+artifacts/
