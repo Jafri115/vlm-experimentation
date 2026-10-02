@@ -51,6 +51,24 @@ Next processing steps on the audio machine:
 
 No audio or validated word alignments are included in the provided archive, so this build cannot complete those steps locally.
 
+### Align on the audio machine
+
+Install `stable-ts` into the intended Python environment. FFmpeg must be on PATH, CUDA must work, and the GPU must be available. The default alignment model is multilingual Whisper `large-v3`; its weights may download on first use. Alignment uses supplied transcript words rather than generating a replacement transcript.
+
+```powershell
+python -m pip install stable-ts
+python scripts/data/align_wd_transcript_variants.py --plan-only
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/orchestration/start_wd_transcript_alignment_background.ps1
+```
+
+If archived media paths are no longer valid, pass `--media-root C:\path\to\sessions` to Python or `-MediaRoot C:\path\to\sessions` to the background launcher. This searches for exact session filenames such as `401001_S1.mp4`; ambiguous matches require `--audio-map` / `-AudioMap` with a CSV containing `session_uid,audio_path`.
+
+Output is `output/wd_transcript_variants_aligned_v1/`. It contains per-source word alignments, a plan, failure diagnostics, dataset summaries, and common eligible segment manifests with the original five fold assignments. Repeated runs reuse successful alignments only if transcript hash, audio hash, and model match. A lock prevents concurrent alignment workers; after a forced termination, check that its PID is no longer running before removing a stale lock.
+
+For a pilot, use `--max-sessions 1` or launcher `-MaxSessions 1`. A pilot produces partial dataset outputs; rerun without the limit before training. Alignment failures are excluded identically across the source comparison and reported. Zero-duration, nonmonotonic, very long words or changed/missing words trigger review. Automatic checks cannot establish real timing accuracy or detect every hallucination; inspect examples at the start, middle and end of sessions before interpreting minute-level results.
+
+The initial runnable LLM datasets deliberately use **speaker-free text across all sources**. `llm_ready=true` means the text can be consumed for this wording control after automated checks; `alignment_reviewed=false` remains explicit. P/T-aware datasets require a separate shared, validated diarization timeline. The alignment run does not produce that timeline or infer identities from transcript semantics.
+
 ## Experimental hypothesis and controls
 
 Primary hypothesis: a reduction in transcript WER improves binary WD_P detection on held-out patients. Secondary hypothesis: it improves severity prediction.
