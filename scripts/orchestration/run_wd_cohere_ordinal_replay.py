@@ -56,8 +56,8 @@ def main(args):
     args.master_root = args.master_root.resolve()
     args.output = args.output.resolve()
     audit = read(args.master_root / 'replacement_audit.json')
-    if audit['rows'] != 4325 or audit['patients'] != 20:
-        raise ValueError('Replacement audit does not describe the expanded frozen cohort')
+    if audit['rows'] != 4325 and not (audit.get('subset_authorized') and audit.get('original_rows')==4325):
+        raise ValueError('Replacement audit does not describe the full or explicitly authorized subset cohort')
     jobs = []
     for tag in args.models:
         for fold in range(1, 6):
@@ -67,9 +67,9 @@ def main(args):
                 raise ValueError(f'Unexpected baseline configuration: {config}')
             manifest = args.master_root / f'fold_{fold}/master_manifest.jsonl'
             data = rows(manifest)
-            if len(data) != 4325 or any(not r['transcript_text'].strip() for r in data):
+            if len(data) != audit['rows'] or any(not r['transcript_text'].strip() for r in data):
                 raise ValueError(f'Incomplete manifest: {manifest}')
-            out = args.output / f'llm_wd_ordinal_{tag}_expanded_cohere_ft_cv' / f'fold_{fold}'
+            out = args.output / f'llm_wd_ordinal_{tag}_{args.cohort_tag}_cv' / f'fold_{fold}'
             identity = {'baseline_config_sha256': sha(config), 'new_manifest_sha256': sha(manifest),
                         'training_script_sha256': sha(TRAINER), 'model': saved['model'],
                         'saved_revision': saved['revision']}
@@ -114,7 +114,7 @@ def main(args):
             print(f'COMPLETED {out.parent.name}/{out.name}', flush=True)
         metrics = []
         for tag in args.models:
-            root = args.output / f'llm_wd_ordinal_{tag}_expanded_cohere_ft_cv'
+            root = args.output / f'llm_wd_ordinal_{tag}_{args.cohort_tag}_cv'
             oof = root / 'oof_predictions.csv'
             subprocess.run([sys.executable, str(REPO / 'scripts/analysis/combine_wd_cv_predictions.py'),
                             '--fold-root', str(root), '--output', str(oof)], cwd=REPO, check=True)
@@ -136,6 +136,7 @@ if __name__ == '__main__':
     p.add_argument('--output', type=Path, default=REPO / 'output/wd_cohere_ordinal_replay')
     p.add_argument('--models', nargs='+', choices=['qwen3_8b', 'qwen3_14b'], default=['qwen3_14b', 'qwen3_8b'])
     p.add_argument('--run', action='store_true')
+    p.add_argument('--cohort-tag', default='expanded_cohere_ft', choices=['expanded_cohere_ft','cohere_available_new','cohere_available_original'])
     p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--config', type=Path, help=argparse.SUPPRESS)
     args = p.parse_args()
