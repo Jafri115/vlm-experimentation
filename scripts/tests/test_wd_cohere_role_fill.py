@@ -48,5 +48,36 @@ class RoleFillTests(unittest.TestCase):
         self.assertEqual(output,'[10:25.1] P: word0 word1\n[10:32.2] T: word2')
         self.assertEqual(builder.timestamp(59.99),'01:00.0')
 
+    def test_contextual_sentence_tail(self):
+        original=[dict(word(0,'T',start=0),text='suizidale'),
+                  dict(word(1,None,start=.5),text='Phase.',end=3.4),
+                  dict(word(2,'P',start=3.8),text='Ich')]
+        result,audit,review=builder.repair_contextual_roles(original)
+        self.assertEqual(result[1]['speaker'],'T')
+        self.assertEqual(audit[0]['method'],'previous_sentence_tail_v2')
+        self.assertFalse(audit[0]['confidence_calibrated'])
+
+    def test_contextual_sentence_prefix(self):
+        original=[dict(word(0,'P',start=0),text='Ende.'),
+                  dict(word(1,None,start=3),text='Und'),
+                  dict(word(2,None,start=3.5),text='die'),
+                  dict(word(3,'T',start=4),text='restlichen')]
+        result,audit,review=builder.repair_contextual_roles(original)
+        self.assertEqual(result[1]['speaker'],'T')
+        self.assertEqual(audit[0]['method'],'next_sentence_prefix_v2')
+
+    def test_contextual_acknowledgment_not_assigned(self):
+        result,audit,review=builder.repair_contextual_roles(
+            [word(0,'P'),dict(word(1,None),text='Okay.'),word(2,'T')])
+        self.assertIsNone(result[1]['speaker']); self.assertFalse(audit)
+        self.assertEqual(review[0]['reason'],'acknowledgment_requires_review')
+
+    def test_contextual_overlap_and_raw_conflict_not_assigned(self):
+        for unknown in [dict(word(1,None,start=.5),text='Ende.',raw_speaker='B'),
+                        dict(word(1,None,start=.5),text='Ende.',end=2.5)]:
+            original=[dict(word(0,'P',start=0,raw='A'),text='ein'),unknown,word(2,'T',start=1.5)]
+            result,audit,review=builder.repair_contextual_roles(original)
+            self.assertIsNone(result[1]['speaker']); self.assertFalse(audit)
+
 
 if __name__=='__main__': unittest.main()

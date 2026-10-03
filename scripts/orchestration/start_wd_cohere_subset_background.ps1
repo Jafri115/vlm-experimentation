@@ -6,7 +6,8 @@ param(
     [string]$QueueRoot = '.\output\wd_cohere_available_queue',
     [switch]$WithOriginalControl,
     [switch]$FillUnknownRoles,
-    [ValidateSet('plain','timestamped_cues')][string]$TurnStyle = 'plain'
+    [ValidateSet('plain','timestamped_cues')][string]$TurnStyle = 'plain',
+    [ValidateSet('bounded','contextual')][string]$RoleFillPolicy = 'bounded'
 )
 $ErrorActionPreference = 'Stop'
 $Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -28,7 +29,8 @@ $OutLog=Join-Path $QueueRoot "background_$Stamp.out.log"
 $ErrLog=Join-Path $QueueRoot "background_$Stamp.err.log"
 $QueueArguments=@('-u',(Join-Path $Repo 'scripts\orchestration\run_wd_cohere_subset_suite.py'),
     '--release-root',$ReleaseRoot,'--original-master',$OriginalMaster,
-    '--dataset-root',$DatasetRoot,'--queue-root',$QueueRoot,'--turn-style',$TurnStyle)
+    '--dataset-root',$DatasetRoot,'--queue-root',$QueueRoot,'--turn-style',$TurnStyle,
+    '--role-fill-policy',$RoleFillPolicy)
 if ($WithOriginalControl) { $QueueArguments += '--with-original-control' }
 if ($FillUnknownRoles) { $QueueArguments += '--fill-unknown-roles' }
 $QuotedArguments=($QueueArguments | ForEach-Object { '"'+$_+'"' }) -join ' '

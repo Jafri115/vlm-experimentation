@@ -18,12 +18,12 @@ def main(args):
     if not prepared.exists():
         command=[sys.executable,'-u',str(REPO/'scripts/data/build_wd_cohere_available_subset.py'),
             '--release-root',str(release),'--original-master',str(args.original_master),
-            '--output',str(args.dataset_root),'--turn-style',args.turn_style]
+            '--output',str(args.dataset_root),'--turn-style',args.turn_style,'--role-fill-policy',args.role_fill_policy]
         if args.fill_unknown_roles: command.append('--fill-unknown-roles')
         subprocess.run(command,cwd=REPO,check=True)
     import hashlib
     audit=json.loads(prepared.read_text(encoding='utf-8'))
-    expected_fill='same_role_bracket_v1' if args.fill_unknown_roles else 'none'
+    expected_fill=('contextual_v2' if args.role_fill_policy=='contextual' else 'same_role_bracket_v1') if args.fill_unknown_roles else 'none'
     if audit.get('role_fill_method','none')!=expected_fill or audit.get('turn_style','plain')!=args.turn_style:
         raise ValueError('Prepared dataset uses different role-fill/format settings; choose a fresh DatasetRoot')
     if audit['source_release_sha256']!=hashlib.sha256((release/'release.json').read_bytes()).hexdigest():
@@ -50,4 +50,5 @@ if __name__=='__main__':
     p.add_argument('--with-original-control',action='store_true')
     p.add_argument('--fill-unknown-roles',action='store_true')
     p.add_argument('--turn-style',choices=['plain','timestamped_cues'],default='plain')
+    p.add_argument('--role-fill-policy',choices=['bounded','contextual'],default='bounded')
     main(p.parse_args())

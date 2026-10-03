@@ -138,3 +138,42 @@ Plan: `output/wd_cohere_available_queue/cohere_new/replay_plan.json`.
 These manifests were generated locally. The GPU training queue has not been
 launched from this workstation; it must be started with the command above on
 the GPU computer. No remote shell connection is configured.
+
+## Extended contextual role repair
+
+`output/wd_cohere_contextual_cues` contains the separate `contextual_v2` variant,
+prepared before one-minute slicing. It uses only original P/T source labels as
+anchors. Same-role islands may be up to 12 words/6 seconds. Sentence-tail and
+sentence-prefix rules use punctuation/connectors plus close timing. These are
+heuristics, not German grammatical parsing or an acoustic speaker recognizer.
+
+Acknowledgments, untimed fragments, long gaps, raw-speaker conflicts and
+overlapping contrary-role speech are not forced. All assigned labels retain
+`roles_verified=false`, `role_source=context_inferred`, and a qualitative
+`strong_context_rule` or `moderate_heuristic` support label. These labels are not
+calibrated probabilities. Word-level repair records are in
+`speaker_role_repairs.json`; unresolved fragments/reasons are in
+`speaker_role_review_candidates.json`.
+
+Prepared results: 6,895 inferred words in 2,186 retained minutes. Minutes with
+unknown roles decrease to 3,093; 792 still have no assigned patient words. The
+same 3,939 segment IDs, words, original human labels and patient folds are retained.
+
+Of the twelve examples proposed by the user, seven were assigned automatically.
+`Okay.` remains for review. Some other fragments sit next to untimed words or
+within larger uncertain passages; their suggested attribution is plausible but
+has not been established by the automatic rules. Examples are in `cue_preview.txt`.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  scripts/orchestration/start_wd_cohere_subset_background.ps1 `
+  -DatasetRoot output\wd_cohere_contextual_cues `
+  -QueueRoot output\wd_cohere_contextual_queue `
+  -FillUnknownRoles `
+  -RoleFillPolicy contextual `
+  -TurnStyle timestamped_cues
+```
+
+Prior exploratory inspection of examples does not establish test-set accuracy.
+Compare this variant against no-fill/bounded controls without claiming automatic
+inference is manually corrected ground truth.
