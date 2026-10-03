@@ -1,7 +1,9 @@
 param(
     [string]$Python = '.\.venv\Scripts\python.exe',
     [string]$MasterRoot = '.\output\wd_multimodal_master_expanded_cohere_ft',
-    [string]$QueueRoot = '.\output\wd_cohere_ordinal_replay'
+    [string]$QueueRoot = '.\output\wd_cohere_ordinal_replay',
+    [string]$ReleaseRoot = '',
+    [string]$OriginalMaster = '.\output\wd_multimodal_master_expanded'
 )
 $ErrorActionPreference = 'Stop'
 $Repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -13,7 +15,7 @@ $Python = Resolve-RepoPath $Python
 $MasterRoot = Resolve-RepoPath $MasterRoot
 $QueueRoot = Resolve-RepoPath $QueueRoot
 if (-not (Test-Path -LiteralPath $Python)) { throw "Python missing: $Python" }
-if (-not (Test-Path -LiteralPath (Join-Path $MasterRoot 'replacement_audit.json'))) {
+if (-not $ReleaseRoot -and -not (Test-Path -LiteralPath (Join-Path $MasterRoot 'replacement_audit.json'))) {
     throw "Transcript replacement is not ready: $MasterRoot"
 }
 New-Item -ItemType Directory -Path $QueueRoot -Force | Out-Null
@@ -22,6 +24,14 @@ $OutLog = Join-Path $QueueRoot "background_$Stamp.out.log"
 $ErrLog = Join-Path $QueueRoot "background_$Stamp.err.log"
 $QueueArguments = @('-u', (Join-Path $Repo 'scripts\orchestration\run_wd_cohere_ordinal_replay.py'),
     '--master-root', $MasterRoot, '--output', $QueueRoot, '--run')
+if ($ReleaseRoot) {
+    $ReleaseRoot = Resolve-RepoPath $ReleaseRoot
+    $OriginalMaster = Resolve-RepoPath $OriginalMaster
+    if (-not (Test-Path -LiteralPath $ReleaseRoot -PathType Container)) { throw "Release missing: $ReleaseRoot" }
+    $QueueArguments = @('-u', (Join-Path $Repo 'scripts\orchestration\run_wd_cohere_release_replay.py'),
+        '--release-root', $ReleaseRoot, '--original-master', $OriginalMaster,
+        '--master-root', $MasterRoot, '--queue-root', $QueueRoot)
+}
 $QuotedArguments = ($QueueArguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
 $Process = Start-Process -FilePath $Python -ArgumentList $QuotedArguments -WorkingDirectory $Repo `
     -WindowStyle Hidden -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog -PassThru

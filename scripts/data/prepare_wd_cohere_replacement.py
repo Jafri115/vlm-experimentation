@@ -104,6 +104,58 @@ def true(value):
     return value is True or str(value).lower() in {'true', '1'}
 
 
+def from_directory(args):
+    """Discover explicitly identified, segment-level Cohere FT tables.
+
+    Session-level text is inventoried but never treated as aligned minute text.
+    Multiple copies of the same segment are accepted only if they agree.
+    """
+    if not args.release_root.is_dir():
+        raise ValueError(f'Release directory missing: {args.release_root}')
+    inventory = []
+    selected = {}
+    sources = []
+    for path in sorted(args.release_root.rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in {'.jsonl', '.csv'}:
+            continue
+        relative = str(path.relative_to(args.release_root))
+        try:
+            rows = read_rows(path)
+        except Exception as exc:
+            inventory.append({'path': relative, 'error': type(exc).__name__})
+            continue
+        columns = list(rows[0]) if rows else []
+        inventory.append({'path': relative, 'rows': len(rows), 'columns': columns})
+        if not {'segment_uid', 'transcript_text', 'start_sec', 'end_sec'}.issubset(columns):
+            continue
+        contributed = False
+        for row in rows:
+            # Provider must be explicit; directory names alone are not provenance.
+            if row.get('transcript_provider') != 'cohere_finetuned':
+                continue
+            uid = row['segment_uid']
+            fields = ('segment_uid', 'transcript_text', 'transcript_text_plain',
+                      'start_sec', 'end_sec', 'transcript_provider', 'timing_validated',
+                      'speaker_roles_validated', 'asr_evaluation_role')
+            replacement = {k: row[k] for k in fields if k in row}
+            if uid in selected and selected[uid] != replacement:
+                raise ValueError(f'Conflicting Cohere transcript/metadata for {uid}: {relative}')
+            selected[uid] = replacement
+            contributed = True
+        if contributed:
+            sources.append({'path': relative, 'sha256': digest(path)})
+    write_json(args.output / 'release_inventory.json', {
+        'release_root': str(args.release_root.resolve()), 'tables': inventory,
+        'selected_segment_count': len(selected), 'selected_sources': sources})
+    if not selected:
+        raise ValueError('No explicitly identified, aligned Cohere fine-tuned segment table found. '
+                         f'See {args.output / "release_inventory.json"}; training was not started. '
+                         'Full-session text needs timing and speaker mapping before replacement.')
+    args.replacements = args.output / 'cohere_ft_replacement_segments.jsonl'
+    write_rows(args.replacements, list(selected.values()))
+    build(args)
+
+
 def build(args):
     original = read_rows(args.master_root / 'paired_master_soft.jsonl')
     old = index(original)
@@ -189,5 +241,10 @@ if __name__ == '__main__':
     a.add_argument('--replacements', type=Path, required=True)
     a.add_argument('--output', type=Path, required=True)
     a.set_defaults(function=build)
+    a = sub.add_parser('from-directory')
+    a.add_argument('--release-root', type=Path, required=True)
+    a.add_argument('--master-root', type=Path, required=True)
+    a.add_argument('--output', type=Path, required=True)
+    a.set_defaults(function=from_directory)
     args = p.parse_args()
     args.function(args)

@@ -92,6 +92,24 @@ cohort. It validates patient disjointness and one outer-test appearance per segm
 
 ## Run on the GPU machine
 
+For the already extracted release, preparation and training can run sequentially
+in the background with one command:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  scripts/orchestration/start_wd_cohere_ordinal_background.ps1 `
+  -ReleaseRoot "C:\Data\Sequence_model\german-asr-pipeline\artifacts\memopsy_196_dataset_versions_v1"
+```
+
+The release scanner accepts explicitly identified `cohere_finetuned` segment
+tables with original identifiers/boundaries and the validation fields described
+above. It does not infer patient/therapist roles or timing from file names. If the
+release uses another schema or contains only full-session text, preparation writes
+`output/wd_multimodal_master_expanded_cohere_ft/release_inventory.json` and stops
+before training. That inventory records table schemas without transcript content;
+use it to adapt the loader to the actual release format. To resume an already
+prepared experiment, omit `-ReleaseRoot`.
+
 First copy the validated replacement data and pull the code. Plan without training:
 
 ```powershell
